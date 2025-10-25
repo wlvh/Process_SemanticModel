@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 import json
 from datetime import datetime
-from typing import Dict, List, Optional, Protocol, Any, Tuple
+from typing import Dict, List, Optional, Protocol, Any, Tuple, Set
 import pandas as pd
 
 # ----------------------------
@@ -57,6 +57,9 @@ class ComprehensiveModelDocumentor:
         self.verbose = verbose
         self.filtered_auto_relationships: int = 0
         self.nl2dax_index: Dict[str, Any] = {}
+        self.compact_mode: bool = True
+        self.max_columns_per_table: int = 8
+        self.include_measure_dax: bool = False
 
     # ---------- Public API ----------
     def generate_complete_documentation(
@@ -64,11 +67,32 @@ class ComprehensiveModelDocumentor:
         model_name: str,
         workspace: Optional[str] = None,
         output_format: str = 'markdown',
-        profile_data: bool = True  # NEW: 默认做数据体检
+        profile_data: bool = True,  # NEW: 默认做数据体检
+        compact: bool = True,
+        max_columns_per_table: int = 8,
+        include_measure_dax: bool = False
     ) -> str:
+        """生成完整语义模型文档
+
+        参数:
+            model_name: 目标语义模型名称。
+            workspace: Fabric 工作区名称；若为空则使用当前上下文。
+            output_format: 'markdown' 或 'json'，控制最终输出格式。
+            profile_data: 是否执行数据体检，默认为 True。
+            compact: 是否启用紧凑模式，仅展示核心列与摘要。
+            max_columns_per_table: 紧凑模式下每张表展示的最大列数。
+            include_measure_dax: 是否在正文中直接展示度量 DAX。
+
+        返回:
+            生成的完整文档字符串。
+        """
         if self.verbose:
             print(f"📚 生成 {model_name} 的完整文档")
             print("=" * 60)
+
+        self.compact_mode = compact
+        self.max_columns_per_table = max_columns_per_table
+        self.include_measure_dax = include_measure_dax
 
         # 1) 元数据
         if self.verbose: print("📊 步骤1: 提取完整元数据...")
@@ -303,15 +327,18 @@ class ComprehensiveModelDocumentor:
         for fact in fact_tables:
             key_info = self._detect_default_time_key(fact, md)
             default_date_column = None
-            fact_columns = [
-                column for column in md.get('columns', [])
-                if column.get('table_name') == fact and 'date' in (column.get('data_type') or '').lower()
-            ]
-            if fact_columns:
-                default_date_column = sorted(
-                    [column.get('column_name') for column in fact_columns],
-                    key=lambda name: (0 if name and 'closed' in name.lower() else 1)
-                )[0]
+            if key_info:
+                default_date_column = self._match_date_column_for_key(fact, key_info[0], md)
+            if not default_date_column:
+                fact_columns = [
+                    column for column in md.get('columns', [])
+                    if column.get('table_name') == fact and 'date' in (column.get('data_type') or '').lower()
+                ]
+                if fact_columns:
+                    default_date_column = sorted(
+                        [column.get('column_name') for column in fact_columns],
+                        key=lambda name: (0 if name and 'closed' in name.lower() else 1)
+                    )[0]
             analysis['fact_time_axes'][fact] = {
                 'default_time_key': key_info[0] if key_info else None,
                 'date_dimension': key_info[1] if key_info else None,
@@ -484,6 +511,45 @@ class ComprehensiveModelDocumentor:
                 return preferred
         return candidates[0]
 
+    def _match_date_column_for_key(self, fact: str, key_col: str, md: Dict[str, Any]) -> Optional[str]:
+        """基于时间键语义匹配事实表最合适的日期列"""
+        if not fact or not key_col:
+            return None
+
+        # 统一时间键语义，便于和日期列名称做模糊对齐
+        base = re.sub(r'key$', '', key_col, flags=re.IGNORECASE)
+        base = base.replace('_', '').lower()
+        preferences = ['submitted', 'sent', 'closed', 'created', 'resolved', 'calendar', 'date', 'time']
+
+        # 找出事实表内所有日期类型的列
+        fact_columns = [
+            column for column in md.get('columns', [])
+            if column.get('table_name') == fact and 'date' in (column.get('data_type') or '').lower()
+        ]
+        if not fact_columns:
+            return None
+
+        # 构建标准化映射，方便做包含关系匹配
+        normalized_columns = [
+            (column.get('column_name'), (column.get('column_name') or '').replace('_', '').replace(' ', '').lower())
+            for column in fact_columns
+        ]
+
+        # 先尝试基于键名的直接包含关系
+        if base:
+            for original, normalized in normalized_columns:
+                if base in normalized:
+                    return original
+
+        # 若未命中，按优先关键词依次尝试
+        for preference in preferences:
+            for original, normalized in normalized_columns:
+                if preference in normalized:
+                    return original
+
+        # 最后兜底返回列表中的第一列
+        return normalized_columns[0][0] if normalized_columns else None
+
     def _select_dimension_label(self, table_name: str, md: Dict[str, Any]) -> Optional[str]:
         """选择维度表中最合适的展示列"""
         if not table_name:
@@ -497,6 +563,12 @@ class ComprehensiveModelDocumentor:
             if (column.get('data_type') or '').lower() not in ['text', 'string']:
                 continue
             candidates.append(column.get('column_name'))
+        priority_keywords = ['name', 'title', 'country', 'region', 'area', 'site', 'queue', 'category']
+        for keyword in priority_keywords:
+            for candidate in candidates:
+                candidate_value = candidate or ''
+                if re.search(rf'\b{keyword}\b', candidate_value, flags=re.IGNORECASE):
+                    return candidate
         for candidate in candidates:
             lowered = (candidate or '').lower()
             if lowered.endswith('name') or lowered.endswith('title'):
@@ -565,8 +637,13 @@ ROW("column","{column_name}","min",_min,"max",_max,"anchor",_max,"nonblank",_non
         for candidate in date_columns:
             try:
                 profiled = _profile_on_date_column(candidate)
-                if profiled:
-                    return profiled
+                if not profiled:
+                    continue
+                if profiled.get('anchor') is None:
+                    if self.verbose:
+                        print(f"⚠️ 日期列 {table}[{candidate}] 锚点为空，继续尝试 via-key 兜底")
+                    continue
+                return profiled
             except Exception as error:
                 if self.verbose:
                     print(f"⚠️ 日期列 {table}[{candidate}] 锚点探测失败: {error}")
@@ -903,7 +980,7 @@ RETURN
 TOPN(
   10,
   SUMMARIZECOLUMNS(
-    'vwpcse_dimgeography'['{country_label}'],
+    'vwpcse_dimgeography'[{country_label}],
     Period,
     "# Closed", [# Case Closed]
   ),
@@ -928,7 +1005,7 @@ RETURN
 TOPN(
   20,
   SUMMARIZECOLUMNS(
-    'vwpcse_dimqueue'['{queue_label}'],
+    'vwpcse_dimqueue'[{queue_label}],
     Window,
     "Median CSAT", [Median CSAT]
   ),
@@ -941,7 +1018,7 @@ RETURN
 TOPN(
   20,
   ADDCOLUMNS(
-    VALUES('vwpcse_dimqueue'['{queue_label}']),
+    VALUES('vwpcse_dimqueue'[{queue_label}]),
     "Median CSAT", CALCULATE([Median CSAT], TREATAS(Window, '{survey_fact}'[{anchor_col or 'SubmittedDate'}]))
   ),
   [Median CSAT], DESC
@@ -974,7 +1051,7 @@ ROW(
     "筛选结果",
     CALCULATE(
         [{first_m['measure_name']}],
-        '{text_c["table_name"]}'['{text_c["column_name"]}'] = "示例值"
+        '{text_c["table_name"]}'[{text_c["column_name"]}] = "示例值"
     )
 )""",
                     'category': 'filtering'
@@ -1011,6 +1088,47 @@ ROW(
         if any(payload.get('has_date_axis') for payload in st.get('fact_time_axes', {}).values()):
             guide['common_patterns'].append("使用 DimDate 日期轴 + 数据锚点进行时间序列分析")
         return guide
+
+    def _expand_synonyms(self, label: Optional[str]) -> List[str]:
+        """生成多语言同义词集合"""
+        if not label:
+            return []
+
+        # 标准化输入，消除下划线/大小写影响
+        base = label.replace('_', ' ').strip()
+        variants: Set[str] = {base, base.lower(), base.title()}
+        keyword_mapping = {
+            'queue': ['队列', 'Queue', 'キュー'],
+            'country': ['国家', 'Country', '国'],
+            'region': ['区域', 'Region', 'リージョン'],
+            'area': ['地区', 'Area', 'エリア'],
+            'site': ['站点', 'Site', 'サイト'],
+            'partner': ['合作伙伴', 'Partner', 'パートナー'],
+            'category': ['类别', 'Category', 'カテゴリ'],
+        }
+        lowered = base.lower()
+        # 根据关键词扩展不同语言的常见别名
+        for keyword, words in keyword_mapping.items():
+            if keyword in lowered:
+                variants.update(words)
+        return sorted(variants)
+
+    def _extract_measure_dependencies(self, dax_expression: Optional[str]) -> Dict[str, List[str]]:
+        """解析度量 DAX 表达式依赖的列与度量"""
+        if not dax_expression:
+            return {'measures': [], 'columns': []}
+
+        # 捕获 '表'[列] 模式，区分列引用
+        column_pairs = re.findall(r"'([^']+)'\[([^\]]+)\]", dax_expression)
+        column_refs = {f"{table}[{column}]" for table, column in column_pairs}
+        column_names = {column for _, column in column_pairs}
+        # 捕获孤立的 [名称] 作为度量引用，并排除已识别的列
+        measure_candidates = re.findall(r'\[([^\[\]]+)\]', dax_expression)
+        measure_refs = sorted({candidate for candidate in measure_candidates if candidate not in column_names})
+        return {
+            'measures': measure_refs,
+            'columns': sorted(column_refs)
+        }
 
     def _build_nl2dax_index(
         self,
@@ -1062,20 +1180,35 @@ ROW(
             table_name = table.get('table_name')
             if st.get('table_types', {}).get(table_name) != 'dimension':
                 continue
-            columns = [column for column in md.get('columns', []) if column.get('table_name') == table_name and not self._safe_bool(column.get('is_hidden'))]
-            primary_key = next((column.get('column_name') for column in columns if self._safe_bool(column.get('is_key')) or self._safe_bool(column.get('is_unique'))), None)
-            label_column = None
-            text_columns = [column for column in columns if (column.get('data_type') or '').lower() in ['string', 'text']]
-            for column in text_columns:
-                name = column.get('column_name') or ''
-                if name.lower().endswith('name') or name.lower().endswith('title'):
-                    label_column = name
-                    break
+            columns = [
+                column for column in md.get('columns', [])
+                if column.get('table_name') == table_name and not self._safe_bool(column.get('is_hidden'))
+            ]
+            primary_key = next(
+                (
+                    column.get('column_name')
+                    for column in columns
+                    if self._safe_bool(column.get('is_key')) or self._safe_bool(column.get('is_unique'))
+                ),
+                None
+            )
+            text_columns = [
+                column for column in columns
+                if (column.get('data_type') or '').lower() in ['string', 'text']
+            ]
+            label_column = self._select_dimension_label(table_name, md)
             if not label_column and text_columns:
                 label_column = text_columns[0].get('column_name')
-            natural_key = next((column.get('column_name') for column in columns if column.get('column_name') and column.get('column_name').lower().endswith(('id', 'code'))), None)
+            natural_key = next(
+                (
+                    column.get('column_name')
+                    for column in columns
+                    if column.get('column_name') and column.get('column_name').lower().endswith(('id', 'code'))
+                ),
+                None
+            )
             friendly_name = table_name.replace('vwpcse_', '') if table_name else ''
-            synonyms = [friendly_name.replace('_', ' ')] if friendly_name else []
+            synonyms = self._expand_synonyms(label_column or friendly_name)
             dimensions[table_name] = {
                 'primary_key': primary_key,
                 'natural_key': natural_key,
@@ -1084,8 +1217,26 @@ ROW(
             }
         if 'vwpcse_dimqueue' in dimensions:
             dimensions['vwpcse_dimqueue']['label'] = dimensions['vwpcse_dimqueue'].get('label') or 'Queue Name'
-            dimensions['vwpcse_dimqueue']['synonyms'] = ['队列', 'Queue', '队列名称']
+            existing_synonyms = dimensions['vwpcse_dimqueue'].get('synonyms', [])
+            queue_synonyms = sorted({*existing_synonyms, '队列', 'Queue', '队列名称'})
+            dimensions['vwpcse_dimqueue']['synonyms'] = queue_synonyms
             dimensions['vwpcse_dimqueue']['join_recommendation'] = 'Prefer QueueKey; QueueID only for Task facts'
+
+        group_by_suggestions: Dict[str, List[str]] = {}
+        for fact_name, schema in st.get('star_schema', {}).items():
+            dimensions_info = schema.get('dimensions', [])
+            suggestions: List[str] = []
+            for dimension_payload in dimensions_info:
+                dimension_table = dimension_payload.get('dimension_table')
+                if not dimension_table:
+                    continue
+                label_name = self._select_dimension_label(dimension_table, md)
+                if label_name:
+                    candidate = f"{dimension_table}[{label_name}]"
+                    if candidate not in suggestions:
+                        suggestions.append(candidate)
+            if suggestions:
+                group_by_suggestions[fact_name] = suggestions[:5]
 
         relationships: List[Dict[str, Any]] = []
         for relationship in md.get('relationships', []):
@@ -1111,10 +1262,12 @@ ROW(
                     break
             format_string = measure.get('format_string') or ''
             unit = 'ratio' if '%' in format_string else ('count' if measure_name.startswith('#') or measure_name.lower().startswith('count') else 'value')
+            dependencies = self._extract_measure_dependencies(measure.get('dax_expression'))
             measures[measure_name] = {
                 'category': category,
                 'unit': unit,
-                'fact_hint': measure.get('table_name')
+                'fact_hint': measure.get('table_name'),
+                'depends_on': dependencies
             }
 
         enums: Dict[str, List[Any]] = {}
@@ -1159,6 +1312,7 @@ TOPN(
             'relationships': relationships,
             'measures': measures,
             'enums': enums,
+            'group_by_suggestions': group_by_suggestions,
             'warnings': warnings
         }
 
@@ -1178,6 +1332,7 @@ TOPN(
         rel_quality: Dict[str, Any] = None
     ) -> str:
         parts: List[str] = []
+        measure_definitions: List[Dict[str, str]] = []
         parts.append(f"# {model_name} - 完整技术文档")
         parts.append(f"\n**生成时间**: {self.analysis_timestamp}")
         parts.append("**文档版本**: 1.3\n")
@@ -1238,15 +1393,18 @@ TOPN(
             if tcols:
                 parts.append("| 列名 | 数据类型 | 说明 | 特性 |")
                 parts.append("|------|----------|------|------|")
-                for c in tcols[:15]:
+                column_limit = len(tcols)
+                if self.compact_mode:
+                    column_limit = min(len(tcols), self.max_columns_per_table)
+                for c in tcols[:column_limit]:
                     name = c.get('column_name',''); dtype = c.get('data_type',''); desc = c.get('description','') or ''
                     feats: List[str] = []
                     if self._safe_bool(c.get('is_key')):      feats.append('🔑主键')
                     if self._safe_bool(c.get('is_unique')):   feats.append('✨唯一')
                     if not self._safe_bool(c.get('is_nullable')): feats.append('❗非空')
                     parts.append(f"| `{name}` | {dtype} | {desc} | {' '.join(feats)} |")
-                if len(tcols) > 15:
-                    parts.append(f"\n*...还有{len(tcols)-15}个列*")
+                if len(tcols) > column_limit:
+                    parts.append(f"\n*...还有{len(tcols)-column_limit}个列 (紧凑模式受限于 {self.max_columns_per_table} 列)*")
             parts.append("")
 
         # 度量
@@ -1258,14 +1416,25 @@ TOPN(
             for nm in names[:10]:
                 m = next((mm for mm in md.get('measures', []) if mm.get('measure_name') == nm), None)
                 if not m: continue
-                parts.append(f"#### [{nm}]")
                 dax = (m.get('dax_expression') or '')
                 dax = re.sub(r'==', '=', dax)
-                parts.append("```dax")
-                parts.append(dax if len(dax) <= 1200 else (dax[:1200] + '...'))
-                parts.append("```")
-                if m.get('format_string'): parts.append(f"**格式**: {m['format_string']}")
-                if m.get('description'):   parts.append(f"**说明**: {m['description']}")
+                if self.include_measure_dax:
+                    parts.append(f"#### [{nm}]")
+                    parts.append("```dax")
+                    parts.append(dax if len(dax) <= 1200 else (dax[:1200] + '...'))
+                    parts.append("```")
+                    if m.get('format_string'): parts.append(f"**格式**: {m['format_string']}")
+                    if m.get('description'):   parts.append(f"**说明**: {m['description']}")
+                else:
+                    bullet = f"- **{nm}**"
+                    description = m.get('description') or ''
+                    if description:
+                        bullet += f"：{description}"
+                    parts.append(bullet)
+                    format_string = m.get('format_string')
+                    if format_string:
+                        parts.append(f"  - 格式: {format_string}")
+                    measure_definitions.append({'name': nm, 'dax': dax})
             if len(names) > 10:
                 parts.append(f"\n*该类别还有{len(names)-10}个度量值*")
         parts.append("")
@@ -1302,11 +1471,17 @@ TOPN(
                 parts.append("| 外键 | 主键 | 空值占比 | 覆盖率 | 告警级别 | 空值数 | 孤儿键数 |")
                 parts.append("|------|------|---------|--------|----------|--------|----------|")
                 for row in summary_rows:
-                    blank_ratio = '' if row.get('blank_ratio') is None else f"{row['blank_ratio']:.2%}"
-                    coverage = '' if row.get('coverage') is None else f"{row['coverage']:.2%}"
+                    blank_ratio_value = row.get('blank_ratio')
+                    coverage_value = row.get('coverage')
+                    blank_ratio = '' if blank_ratio_value is None else f"{blank_ratio_value:.2%}"
+                    coverage = '' if coverage_value is None else f"{coverage_value:.2%}"
+                    blank_fk_value = row.get('blank_fk')
+                    orphan_fk_value = row.get('orphan_fk')
+                    blank_fk_text = '' if blank_fk_value is None else str(blank_fk_value)
+                    orphan_fk_text = '' if orphan_fk_value is None else str(orphan_fk_value)
                     parts.append(
                         f"| {row.get('from')} | {row.get('to')} | {blank_ratio} | {coverage} | "
-                        f"{row.get('severity','green').upper()} | {row.get('blank_fk','')} | {row.get('orphan_fk','')} |"
+                        f"{row.get('severity','green').upper()} | {blank_fk_text} | {orphan_fk_text} |"
                     )
             if lint_msgs:
                 parts.append("\n**模型提示**")
@@ -1353,6 +1528,8 @@ TOPN(
                          f"{self.nl2dax_index.get('date_axis', {}).get('key_column')}")
             parts.append("- **事实表摘要**: 提供默认时间键、锚点策略、行数等信息")
             parts.append("- **维度展示列**: label/synonym 信息已收录，供 NL2DAX 快速对齐术语")
+            parts.append("- **推荐分组列**: group_by_suggestions 提供事实表常用维度字段")
+            parts.append("- **度量依赖图**: depends_on 字段列出所引用的度量与列")
             parts.append("- **文件位置**: `nl2dax_index.json` (与本文档同目录)\n")
 
         # 附录
@@ -1368,6 +1545,16 @@ TOPN(
                     f"{payload.get('default_time_key') or ''} | {payload.get('date_dimension') or ''} | {verdict} |"
                 )
             parts.append("")
+        if not self.include_measure_dax and measure_definitions:
+            parts.append("### 度量值定义（完整 DAX）\n")
+            parts.append("<details>")
+            parts.append("<summary>点击展开查看全部度量定义</summary>\n")
+            for definition in measure_definitions:
+                parts.append(f"#### [{definition['name']}]")
+                parts.append("```dax")
+                parts.append(definition['dax'])
+                parts.append("```")
+            parts.append("</details>\n")
         if md.get('auto_date_tables'):
             parts.append("### 自动生成的日期表")
             parts.append("Power BI为以下日期列自动创建了时间智能表：\n")
