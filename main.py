@@ -583,38 +583,42 @@ class ComprehensiveModelDocumentor:
         md: Dict[str, Any],
         table: str
     ) -> Dict[str, Any]:
+        # ---- 小工具 ----
         def _dtype_is_date_like(data_type: str) -> bool:
             lowered = (data_type or '').lower()
             return any(flag in lowered for flag in ['date', 'datetime', 'timestamp', 'time'])
 
         def _score(column_name: str) -> float:
+            """日期列优先级：Submitted > Sent > Closed > Created/Resolved > Calendar > Date > 其它；纯 Time 略降权"""
             lowered = (column_name or '').lower()
             base = 1.0
-            if 'submitted' in lowered:
-                base = 6.0
-            elif 'sent' in lowered:
-                base = 5.0
-            elif 'closed' in lowered:
-                base = 4.0
-            elif 'created' in lowered:
-                base = 3.5
-            elif 'resolved' in lowered:
-                base = 3.2
-            elif 'calendar' in lowered:
-                base = 3.0
-            elif 'date' in lowered:
-                base = 2.0
+            if 'submitted' in lowered: base = 6.0
+            elif 'sent' in lowered:    base = 5.0
+            elif 'closed' in lowered:  base = 4.0
+            elif 'created' in lowered: base = 3.5
+            elif 'resolved' in lowered:base = 3.2
+            elif 'calendar' in lowered:base = 3.0
+            elif 'date' in lowered:    base = 2.0
             if 'time' in lowered and 'date' not in lowered:
                 base -= 0.6
             return base
 
-        date_columns = [
-            column.get('column_name')
-            for column in md.get('columns', [])
-            if column.get('table_name') == table and _dtype_is_date_like(column.get('data_type'))
+        # 1) 收集候选日期列：先按 DataType，再按列名兜底
+        typed_candidates = [
+            c.get('column_name')
+            for c in md.get('columns', [])
+            if c.get('table_name') == table and _dtype_is_date_like(c.get('data_type'))
         ]
-        date_columns = sorted(date_columns, key=_score, reverse=True)
+        name_candidates = [
+            c.get('column_name')
+            for c in md.get('columns', [])
+            if c.get('table_name') == table and any(k in (c.get('column_name') or '').lower() for k in ['date', 'time'])
+        ]
+        date_columns = typed_candidates or name_candidates
+        # 去重+优先级排序
+        date_columns = sorted(list({dc for dc in date_columns if dc}), key=_score, reverse=True)
 
+        # 2) 直接用事实表日期列做锚点（逐个尝试）
         def _profile_on_date_column(column_name: str) -> Optional[Dict[str, Any]]:
             dax = f"""
 EVALUATE
@@ -639,65 +643,79 @@ ROW("column","{column_name}","min",_min,"max",_max,"anchor",_max,"nonblank",_non
             df_result = self.runner.evaluate(dataset=model_name, dax=dax, workspace=workspace)
             if df_result.empty:
                 return None
-            record = df_result.iloc[0].to_dict()
-            anchor_value = record.get('anchor')
-            if pd.isna(anchor_value):
+            rec = df_result.iloc[0].to_dict()
+            if pd.isna(rec.get('anchor')):
                 return None
             return {
-                'anchor_column': record.get('column'),
-                'min': record.get('min'),
-                'max': record.get('max'),
-                'anchor': anchor_value,
-                'nonblank': int(record.get('nonblank')) if pd.notna(record.get('nonblank')) else None,
-                'cnt7': int(record.get('cnt7')) if pd.notna(record.get('cnt7')) else None,
-                'cnt30': int(record.get('cnt30')) if pd.notna(record.get('cnt30')) else None,
-                'cnt90': int(record.get('cnt90')) if pd.notna(record.get('cnt90')) else None
+                'anchor_column': rec.get('column'),
+                'min': rec.get('min'),
+                'max': rec.get('max'),
+                'anchor': rec.get('anchor'),
+                'nonblank': self._to_int_or_none(rec.get('nonblank')),
+                'cnt7': self._to_int_or_none(rec.get('cnt7')),
+                'cnt30': self._to_int_or_none(rec.get('cnt30')),
+                'cnt90': self._to_int_or_none(rec.get('cnt90'))
             }
 
-        for candidate in date_columns:
+        # 先试前 5 个候选（通常足够覆盖 Submitted/Sent/Closed/...）
+        for candidate in date_columns[:5]:
             try:
                 profiled = _profile_on_date_column(candidate)
-                if not profiled:
-                    continue
-                if profiled.get('anchor') is None:
-                    if self.verbose:
-                        print(f"⚠️ 日期列 {table}[{candidate}] 锚点为空，继续尝试 via-key 兜底")
-                    continue
-                return profiled
-            except Exception as error:
+                if profiled and profiled.get('anchor') is not None:
+                    return profiled
+                elif self.verbose and profiled is None:
+                    print(f"ℹ️ {table}[{candidate}] 无有效锚点，继续尝试…")
+            except Exception as e:
                 if self.verbose:
-                    print(f"⚠️ 日期列 {table}[{candidate}] 锚点探测失败: {error}")
+                    print(f"⚠️ 日期列 {table}[{candidate}] 锚点探测失败: {e}")
 
+        # 3) via-key：用 DimDate + 键映射；支持“文本↔数值”轻度类型不一致的自适配
         key_info = self._detect_default_time_key(table, md)
         if key_info:
             fact_key, dim_table, dim_key = key_info
-            fact_dtype = next(
-                (column.get('data_type') for column in md.get('columns', [])
-                 if column.get('table_name') == table and column.get('column_name') == fact_key),
-                None
-            )
-            dim_dtype = next(
-                (column.get('data_type') for column in md.get('columns', [])
-                 if column.get('table_name') == dim_table and column.get('column_name') == dim_key),
-                None
-            )
-            if fact_dtype and dim_dtype and fact_dtype.split()[0].lower() != dim_dtype.split()[0].lower():
-                if self.verbose:
-                    print(f"⚠️ {table}[{fact_key}] 与 {dim_table}[{dim_key}] 类型不一致（{fact_dtype} vs {dim_dtype}），跳过 via-key 锚点。")
-            else:
-                dim_date_column = self._select_dim_date_column(dim_table, md)
-                if dim_date_column:
-                    dax_key = f"""
-EVALUATE
-VAR KeySet =
-    CALCULATETABLE(VALUES('{table}'[{fact_key}]), ALL('{table}'))
 
+            # 键两侧的数据类型（用于判断是否需要轻度转换）
+            fact_dtype = next((c.get('data_type') for c in md.get('columns', [])
+                               if c.get('table_name') == table and c.get('column_name') == fact_key), '') or ''
+            dim_dtype  = next((c.get('data_type') for c in md.get('columns', [])
+                               if c.get('table_name') == dim_table and c.get('column_name') == dim_key), '') or ''
+            f_l = fact_dtype.lower(); d_l = dim_dtype.lower()
+
+            dim_date_column = self._select_dim_date_column(dim_table, md)
+            if dim_date_column:
+                # 构造 KeySet 表达式 & 可选的类型收敛
+                # - TEXT→NUM: VALUE()
+                # - NUM→TEXT: FORMAT(...,"0")（假设 DateKey 形如无前导零的纯数字；可按需要改成 "0;-0;0"）
+                keyset_raw = f"CALCULATETABLE(VALUES('{table}'[{fact_key}]), ALL('{table}'))"
+
+                keyset_expr = keyset_raw  # 默认不变
+                try_coerce = False
+                if f_l and d_l and f_l.split()[0] != d_l.split()[0]:
+                    # 仅在“文本<->数值”场景尝试轻度收敛，避免其它类型的误伤
+                    is_fact_text = 'text' in f_l or 'string' in f_l
+                    is_dim_text  = 'text' in d_l or 'string' in d_l
+                    is_fact_num  = any(x in f_l for x in ['int', 'integer', 'decimal', 'double', 'number'])
+                    is_dim_num   = any(x in d_l for x in ['int', 'integer', 'decimal', 'double', 'number'])
+
+                    if is_fact_text and is_dim_num:
+                        keyset_expr = (
+                            f"SELECTCOLUMNS({keyset_raw}, \"__k\", VALUE('{table}'[{fact_key}]))"
+                        )
+                        try_coerce = True
+                    elif is_fact_num and is_dim_text:
+                        keyset_expr = (
+                            f"SELECTCOLUMNS({keyset_raw}, \"__k\", FORMAT('{table}'[{fact_key}], \"0\"))"
+                        )
+                        try_coerce = True
+
+                dax_key = f"""
+EVALUATE
+VAR KeySet = {keyset_expr}
 VAR _anchorDate =
     CALCULATE(
         MAX('{dim_table}'[{dim_date_column}]),
         TREATAS(KeySet, '{dim_table}'[{dim_key}])
     )
-
 VAR _minDate =
     CALCULATE(
         MIN('{dim_table}'[{dim_date_column}]),
@@ -762,7 +780,7 @@ VAR _nonblank =
 
 RETURN
 ROW(
-    "column", "{fact_key}",
+    "column", "{fact_key}" & IF({str(try_coerce).upper()}, " (coerced)", ""),
     "min", _minDate,
     "max", _anchorDate,
     "anchor", _anchorDate,
@@ -772,39 +790,36 @@ ROW(
     "cnt90", _cnt90
 )
 """
-                    try:
-                        df_key = self.runner.evaluate(dataset=model_name, dax=dax_key, workspace=workspace)
-                        if not df_key.empty:
-                            record = df_key.iloc[0].to_dict()
+                try:
+                    df_key = self.runner.evaluate(dataset=model_name, dax=dax_key, workspace=workspace)
+                    if not df_key.empty:
+                        rec = df_key.iloc[0].to_dict()
+                        if pd.notna(rec.get('anchor')):
                             return {
-                                'anchor_column': record.get('column'),
-                                'min': record.get('min'),
-                                'max': record.get('max'),
-                                'anchor': record.get('anchor'),
-                                'nonblank': int(record.get('nonblank')) if pd.notna(record.get('nonblank')) else None,
-                                'cnt7': int(record.get('cnt7')) if pd.notna(record.get('cnt7')) else None,
-                                'cnt30': int(record.get('cnt30')) if pd.notna(record.get('cnt30')) else None,
-                                'cnt90': int(record.get('cnt90')) if pd.notna(record.get('cnt90')) else None,
+                                'anchor_column': rec.get('column'),
+                                'min': rec.get('min'),
+                                'max': rec.get('max'),
+                                'anchor': rec.get('anchor'),
+                                'nonblank': self._to_int_or_none(rec.get('nonblank')),
+                                'cnt7': self._to_int_or_none(rec.get('cnt7')),
+                                'cnt30': self._to_int_or_none(rec.get('cnt30')),
+                                'cnt90': self._to_int_or_none(rec.get('cnt90')),
                                 'anchor_via_key': True,
                                 'date_dimension': dim_table,
                                 'date_axis_column': dim_date_column
                             }
-                    except Exception as error:
-                        if self.verbose:
-                            print(f"⚠️ 键列 {table}[{fact_key}] 锚点探测失败: {error}")
+                except Exception as e:
+                    if self.verbose:
+                        print(f"⚠️ 键列 {table}[{fact_key}] via-key 锚点探测失败: {e}")
 
+        # 4) COALESCE 兜底：把前 3 个日期列合成一个虚拟日期轴
         if date_columns:
-            # 使用评分最高的前三个日期列构建 COALESCE 表达式, 兜底生成合成日期锚点
             top_cols = date_columns[:3]
-            coalesce_expr = "COALESCE(" + ", ".join([f"'{table}'[{column}]" for column in top_cols]) + ")"
+            coalesce_expr = "COALESCE(" + ", ".join([f"'{table}'[{c}]" for c in top_cols]) + ")"
             joined = ', '.join(top_cols)
             dax_coalesce = f"""
 EVALUATE
-VAR _x =
-    ADDCOLUMNS(
-        ALL('{table}'),
-        "__d", {coalesce_expr}
-    )
+VAR _x = ADDCOLUMNS(ALL('{table}'), "__d", {coalesce_expr})
 VAR _min = MINX(_x, [__d])
 VAR _max = MAXX(_x, [__d])
 VAR _nonblank = COUNTROWS(FILTER(_x, NOT(ISBLANK([__d]))))
@@ -815,35 +830,31 @@ VAR _cnt30 = IF(NOT(ISBLANK(_max)),
 VAR _cnt90 = IF(NOT(ISBLANK(_max)),
     COUNTROWS(FILTER(_x, NOT(ISBLANK([__d])) && [__d] > _max - 90 && [__d] <= _max)), BLANK())
 RETURN
-ROW(
-    "column","COALESCE(" & "{joined}" & ")",
-    "min",_min,"max",_max,"anchor",_max,"nonblank",_nonblank,"cnt7",_cnt7,"cnt30",_cnt30,"cnt90",_cnt90
-)
+ROW("column","COALESCE(" & "{joined}" & ")", "min",_min,"max",_max,"anchor",_max,"nonblank",_nonblank,"cnt7",_cnt7,"cnt30",_cnt30,"cnt90",_cnt90)
 """
             try:
-                df_coalesce = self.runner.evaluate(dataset=model_name, dax=dax_coalesce, workspace=workspace)
-                if not df_coalesce.empty:
-                    record = df_coalesce.iloc[0].to_dict()
-                    anchor_value = record.get('anchor')
-                    if pd.notna(anchor_value):
+                df_c = self.runner.evaluate(dataset=model_name, dax=dax_coalesce, workspace=workspace)
+                if not df_c.empty:
+                    rec = df_c.iloc[0].to_dict()
+                    if pd.notna(rec.get('anchor')):
                         if self.verbose:
-                            print(f"ℹ️  使用 COALESCE 作为 {table} 的日期锚点: {joined}")
+                            print(f"ℹ️ 使用 COALESCE 作为 {table} 的日期锚点: {joined}")
                         return {
-                            'anchor_column': record.get('column'),
-                            'min': record.get('min'),
-                            'max': record.get('max'),
-                            'anchor': anchor_value,
-                            'nonblank': self._to_int_or_none(record.get('nonblank')),
-                            'cnt7': self._to_int_or_none(record.get('cnt7')),
-                            'cnt30': self._to_int_or_none(record.get('cnt30')),
-                            'cnt90': self._to_int_or_none(record.get('cnt90')),
+                            'anchor_column': rec.get('column'),
+                            'min': rec.get('min'),
+                            'max': rec.get('max'),
+                            'anchor': rec.get('anchor'),
+                            'nonblank': self._to_int_or_none(rec.get('nonblank')),
+                            'cnt7': self._to_int_or_none(rec.get('cnt7')),
+                            'cnt30': self._to_int_or_none(rec.get('cnt30')),
+                            'cnt90': self._to_int_or_none(rec.get('cnt90')),
                             'anchor_via_coalesce': True
                         }
-            except Exception as error:
+            except Exception as e:
                 if self.verbose:
-                    print(f"⚠️ COALESCE 锚点探测失败 {table}: {error}")
+                    print(f"⚠️ COALESCE 锚点探测失败 {table}: {e}")
 
-        # 若所有策略均未获取到有效锚点, 返回空结构供上层显示
+        # 5) 彻底兜底：仍无锚点则返回空结构（供表格显示）
         return {
             'anchor_column': date_columns[0] if date_columns else None,
             'min': None,
