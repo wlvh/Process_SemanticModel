@@ -668,67 +668,86 @@ ROW("column","{column_name}","min",_min,"max",_max,"anchor",_max,"nonblank",_non
                 if self.verbose:
                     print(f"⚠️ 日期列 {table}[{candidate}] 锚点探测失败: {e}")
 
-        # 3) via-key：用 DimDate + 键映射；支持“文本↔数值”轻度类型不一致的自适配
+        # 3) via-key：用 DimDate + 键映射（回到 TREATAS 写法），并对两端做轻度类型自适配
         key_info = self._detect_default_time_key(table, md)
         if key_info:
             fact_key, dim_table, dim_key = key_info
 
-            fact_dtype = next((c.get('data_type') for c in md.get('columns', [])
-                               if c.get('table_name') == table and c.get('column_name') == fact_key), '') or ''
-            dim_dtype = next((c.get('data_type') for c in md.get('columns', [])
-                              if c.get('table_name') == dim_table and c.get('column_name') == dim_key), '') or ''
-            f_l = fact_dtype.lower()
-            d_l = dim_dtype.lower()
+            fact_dtype = (next((c.get('data_type') for c in md.get('columns', [])
+                                if c.get('table_name') == table and c.get('column_name') == fact_key), '') or '').lower()
+            dim_dtype = (next((c.get('data_type') for c in md.get('columns', [])
+                               if c.get('table_name') == dim_table and c.get('column_name') == dim_key), '') or '').lower()
 
             dim_date_column = self._select_dim_date_column(dim_table, md)
             if dim_date_column:
-                keyraw = f"CALCULATETABLE(VALUES('{table}'[{fact_key}]), ALL('{table}'))"
-                is_fact_text = ('text' in f_l) or ('string' in f_l)
-                is_dim_text = ('text' in d_l) or ('string' in d_l)
-                is_fact_num = any(x in f_l for x in ['int', 'integer', 'decimal', 'double', 'number'])
-                is_dim_num = any(x in d_l for x in ['int', 'integer', 'decimal', 'double', 'number'])
-                if f_l and d_l and f_l.split()[0] != d_l.split()[0]:
-                    if is_fact_text and is_dim_num:
-                        keyset = f"SELECTCOLUMNS({keyraw}, \"__k\", VALUE('{table}'[{fact_key}]))"
-                    elif is_fact_num and is_dim_text:
-                        keyset = f"SELECTCOLUMNS({keyraw}, \"__k\", FORMAT('{table}'[{fact_key}], \"0\"))"
-                    else:
-                        keyset = f"SELECTCOLUMNS({keyraw}, \"__k\", '{table}'[{fact_key}])"
+                is_fact_text = ('text' in fact_dtype) or ('string' in fact_dtype)
+                is_dim_text = ('text' in dim_dtype) or ('string' in dim_dtype)
+                is_fact_num = any(x in fact_dtype for x in ['int', 'integer', 'decimal', 'double', 'number'])
+                is_dim_num = any(x in dim_dtype for x in ['int', 'integer', 'decimal', 'double', 'number'])
+
+                # fact -> dim 的键值“方向”转换（用于 AnchorDate 的 TREATAS）
+                if is_fact_text and is_dim_num:
+                    fact_to_dim = f"VALUE('{table}'[{fact_key}])"
+                elif is_fact_num and is_dim_text:
+                    fact_to_dim = f"FORMAT('{table}'[{fact_key}], \"0\")"
                 else:
-                    keyset = f"SELECTCOLUMNS({keyraw}, \"__k\", '{table}'[{fact_key}])"
+                    fact_to_dim = f"'{table}'[{fact_key}]"
+
+                # dim -> fact 的键值“方向”转换（用于窗口 Keys 应用回事实表）
+                if is_dim_text and is_fact_num:
+                    dim_to_fact = f"VALUE('{dim_table}'[{dim_key}])"
+                elif is_dim_num and is_fact_text:
+                    dim_to_fact = f"FORMAT('{dim_table}'[{dim_key}], \"0\")"
+                else:
+                    dim_to_fact = f"'{dim_table}'[{dim_key}]"
 
                 dax_key = f"""
 EVALUATE
-VAR KeySet = {keyset}
-VAR DimMap =
-    SELECTCOLUMNS('{dim_table}',
-        "__k", '{dim_table}'[{dim_key}],
-        "__d", '{dim_table}'[{dim_date_column}]
+VAR KeyFact    = CALCULATETABLE(VALUES('{table}'[{fact_key}]), ALL('{table}'))
+VAR KeySetDim  = SELECTCOLUMNS(KeyFact, "__k", {fact_to_dim})
+VAR AnchorDate =
+    CALCULATE(
+        MAX('{dim_table}'[{dim_date_column}]),
+        TREATAS(KeySetDim, '{dim_table}'[{dim_key}])
     )
-VAR J = NATURALINNERJOIN(KeySet, DimMap)
-VAR _anchorDate = MAXX(J, [__d])
-VAR _minDate    = MINX(J, [__d])
-VAR _cnt90 = IF(ISBLANK(_anchorDate), BLANK(), COUNTROWS(FILTER(J, NOT ISBLANK([__d]) && [__d] > _anchorDate - 90 && [__d] <= _anchorDate)))
-VAR _cnt30 = IF(ISBLANK(_anchorDate), BLANK(), COUNTROWS(FILTER(J, NOT ISBLANK([__d]) && [__d] > _anchorDate - 30 && [__d] <= _anchorDate)))
-VAR _cnt7  = IF(ISBLANK(_anchorDate), BLANK(), COUNTROWS(FILTER(J, NOT ISBLANK([__d]) && [__d] > _anchorDate - 7  && [__d] <= _anchorDate)))
-VAR _nonblank =
-    COUNTROWS(
-        FILTER(
-            ALL('{table}'),
-            NOT(ISBLANK('{table}'[{fact_key}]))
-        )
+VAR MinDate =
+    CALCULATE(
+        MIN('{dim_table}'[{dim_date_column}]),
+        TREATAS(KeySetDim, '{dim_table}'[{dim_key}])
     )
+
+/* 在 DimDate 上取窗口，再把键“转换回”事实表类型，应用到事实表做计数 */
+VAR Win90Dim  = IF(ISBLANK(AnchorDate), BLANK(),
+    CALCULATETABLE(VALUES('{dim_table}'[{dim_key}]), DATESINPERIOD('{dim_table}'[{dim_date_column}], AnchorDate, -90, DAY)))
+VAR Win30Dim  = IF(ISBLANK(AnchorDate), BLANK(),
+    CALCULATETABLE(VALUES('{dim_table}'[{dim_key}]), DATESINPERIOD('{dim_table}'[{dim_date_column}], AnchorDate, -30, DAY)))
+VAR Win7Dim   = IF(ISBLANK(AnchorDate),  BLANK(),
+    CALCULATETABLE(VALUES('{dim_table}'[{dim_key}]), DATESINPERIOD('{dim_table}'[{dim_date_column}], AnchorDate,  -7, DAY)))
+
+VAR Win90Fact = SELECTCOLUMNS(Win90Dim, "__k", {dim_to_fact})
+VAR Win30Fact = SELECTCOLUMNS(Win30Dim, "__k", {dim_to_fact})
+VAR Win7Fact  = SELECTCOLUMNS(Win7Dim,  "__k", {dim_to_fact})
+
+VAR Cnt90 = IF(ISBLANK(AnchorDate), BLANK(),
+    CALCULATE(COUNTROWS('{table}'), TREATAS(Win90Fact, '{table}'[{fact_key}])))
+VAR Cnt30 = IF(ISBLANK(AnchorDate), BLANK(),
+    CALCULATE(COUNTROWS('{table}'), TREATAS(Win30Fact, '{table}'[{fact_key}])))
+VAR Cnt7  = IF(ISBLANK(AnchorDate), BLANK(),
+    CALCULATE(COUNTROWS('{table}'), TREATAS(Win7Fact , '{table}'[{fact_key}])))
+
+VAR NonBlankFK =
+    COUNTROWS(FILTER(ALL('{table}'), NOT ISBLANK('{table}'[{fact_key}])))
 
 RETURN
 ROW(
     "column", "{fact_key}",
-    "min", _minDate,
-    "max", _anchorDate,
-    "anchor", _anchorDate,
-    "nonblank", _nonblank,
-    "cnt7", _cnt7,
-    "cnt30", _cnt30,
-    "cnt90", _cnt90
+    "min", MinDate,
+    "max", AnchorDate,
+    "anchor", AnchorDate,
+    "nonblank", NonBlankFK,
+    "cnt7", Cnt7,
+    "cnt30", Cnt30,
+    "cnt90", Cnt90
 )
 """
                 try:
@@ -753,9 +772,16 @@ ROW(
                     if self.verbose:
                         print(f"⚠️ 键列 {table}[{fact_key}] via-key 锚点探测失败: {e}")
 
-        # 4) COALESCE 兜底：把前 3 个日期列合成一个虚拟日期轴
-        if len(date_cols_direct) >= 2:
-            top_cols = date_cols_direct[:3]
+        # 4) COALESCE 兜底：类型候选 ∪ 名称候选，能覆盖“列名含 date/time 但类型标注异常”的情形
+        union_candidates: List[str] = []
+        seen: Set[str] = set()
+        for c in (date_cols_direct + name_candidates):
+            if c and c not in seen:
+                union_candidates.append(c)
+                seen.add(c)
+
+        if len(union_candidates) >= 2:
+            top_cols = union_candidates[:3]
             coalesce_expr = "COALESCE(" + ", ".join([f"'{table}'[{c}]" for c in top_cols]) + ")"
             joined = ', '.join(top_cols)
             dax_coalesce = f"""
