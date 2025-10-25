@@ -696,7 +696,7 @@ ROW("column","{column_name}","min",_min,"max",_max,"anchor",_max,"nonblank",_non
                 is_fact_num = any(flag in fact_dtype for flag in num_flags)
                 is_dim_num = any(flag in dim_dtype for flag in num_flags)
 
-                fk_in_row = f"[{fact_key}]"
+                fk_in_row = f"'{table}'[{fact_key}]"
                 if is_fact_text and is_dim_num:
                     fact_to_dim = f"VALUE({fk_in_row})"
                 elif is_fact_num and is_dim_text:
@@ -704,7 +704,7 @@ ROW("column","{column_name}","min",_min,"max",_max,"anchor",_max,"nonblank",_non
                 else:
                     fact_to_dim = fk_in_row
 
-                dim_in_row = f"[{dim_key}]"
+                dim_in_row = f"'{dim_table}'[{dim_key}]"
                 if is_dim_text and is_fact_num:
                     dim_to_fact = f"VALUE({dim_in_row})"
                 elif is_dim_num and is_fact_text:
@@ -728,23 +728,44 @@ VAR MinDate =
     )
 
 /* 在 DimDate 上取窗口，再把键“转换回”事实表类型，应用到事实表做计数 */
-VAR Win90Dim  = IF(ISBLANK(AnchorDate), BLANK(),
-    CALCULATETABLE(VALUES('{dim_table}'[{dim_key}]), DATESINPERIOD('{dim_table}'[{dim_date_column}], AnchorDate, -90, DAY)))
-VAR Win30Dim  = IF(ISBLANK(AnchorDate), BLANK(),
-    CALCULATETABLE(VALUES('{dim_table}'[{dim_key}]), DATESINPERIOD('{dim_table}'[{dim_date_column}], AnchorDate, -30, DAY)))
-VAR Win7Dim   = IF(ISBLANK(AnchorDate),  BLANK(),
-    CALCULATETABLE(VALUES('{dim_table}'[{dim_key}]), DATESINPERIOD('{dim_table}'[{dim_date_column}], AnchorDate,  -7, DAY)))
+VAR Win90Dim =
+    CALCULATETABLE (
+        VALUES('{dim_table}'[{dim_key}]),
+        FILTER (
+            ALL('{dim_table}'[{dim_date_column}]),
+            NOT ISBLANK(AnchorDate)
+                && '{dim_table}'[{dim_date_column}] > AnchorDate - 90
+                && '{dim_table}'[{dim_date_column}] <= AnchorDate
+        )
+    )
+VAR Win30Dim =
+    CALCULATETABLE (
+        VALUES('{dim_table}'[{dim_key}]),
+        FILTER (
+            ALL('{dim_table}'[{dim_date_column}]),
+            NOT ISBLANK(AnchorDate)
+                && '{dim_table}'[{dim_date_column}] > AnchorDate - 30
+                && '{dim_table}'[{dim_date_column}] <= AnchorDate
+        )
+    )
+VAR Win7Dim =
+    CALCULATETABLE (
+        VALUES('{dim_table}'[{dim_key}]),
+        FILTER (
+            ALL('{dim_table}'[{dim_date_column}]),
+            NOT ISBLANK(AnchorDate)
+                && '{dim_table}'[{dim_date_column}] > AnchorDate - 7
+                && '{dim_table}'[{dim_date_column}] <= AnchorDate
+        )
+    )
 
 VAR Win90Fact = SELECTCOLUMNS(Win90Dim, "__k", {dim_to_fact})
 VAR Win30Fact = SELECTCOLUMNS(Win30Dim, "__k", {dim_to_fact})
 VAR Win7Fact  = SELECTCOLUMNS(Win7Dim,  "__k", {dim_to_fact})
 
-VAR Cnt90 = IF(ISBLANK(AnchorDate), BLANK(),
-    CALCULATE(COUNTROWS('{table}'), TREATAS(Win90Fact, '{table}'[{fact_key}])))
-VAR Cnt30 = IF(ISBLANK(AnchorDate), BLANK(),
-    CALCULATE(COUNTROWS('{table}'), TREATAS(Win30Fact, '{table}'[{fact_key}])))
-VAR Cnt7  = IF(ISBLANK(AnchorDate), BLANK(),
-    CALCULATE(COUNTROWS('{table}'), TREATAS(Win7Fact , '{table}'[{fact_key}])))
+VAR Cnt90 = CALCULATE(COUNTROWS('{table}'), TREATAS(Win90Fact, '{table}'[{fact_key}]))
+VAR Cnt30 = CALCULATE(COUNTROWS('{table}'), TREATAS(Win30Fact, '{table}'[{fact_key}]))
+VAR Cnt7  = CALCULATE(COUNTROWS('{table}'), TREATAS(Win7Fact , '{table}'[{fact_key}]))
 
 VAR NonBlankFK =
     COUNTROWS(FILTER(ALL('{table}'), NOT ISBLANK('{table}'[{fact_key}])))
@@ -1306,14 +1327,80 @@ ROW(
         profiles = profiles or {}
         time_anchors = profiles.get('time_anchors', {})
         facts_rowcount = profiles.get('facts_rowcount', {})
+        time_defaults: Dict[str, Any] = {}
         for fact_name, payload in fact_time_axes.items():
             anchor_profile = time_anchors.get(fact_name, {})
+            # 聚合锚点相关的关键字段，优先使用数据体检结果，其次退回结构分析推断
+            anchor_column = anchor_profile.get('anchor_column') or payload.get('default_time_column')
+            dim_table_name = anchor_profile.get('date_dimension') or payload.get('date_dimension')
+            dim_key_name = anchor_profile.get('date_dimension_key') or payload.get('date_dimension_key')
+            dim_date_column = anchor_profile.get('date_axis_column') or (
+                self._select_dim_date_column(dim_table_name, md) if dim_table_name else None
+            )
+
+            anchor_expr_direct: Optional[str] = None
+            anchor_expr_via_key: Optional[str] = None
+            # 根据锚点探测路径生成可直接复用的 DAX 表达式
+            if anchor_profile.get('anchor_via_key'):
+                fact_key_name = payload.get('default_time_key')
+                if fact_key_name and dim_table_name and dim_key_name and dim_date_column:
+                    anchor_expr_via_key = (
+                        f"CALCULATE(MAX('{dim_table_name}'[{dim_date_column}]), "
+                        f"TREATAS(VALUES('{fact_name}'[{fact_key_name}]), '{dim_table_name}'[{dim_key_name}]))"
+                    )
+            else:
+                if anchor_column:
+                    if isinstance(anchor_column, str) and anchor_column.upper().startswith('COALESCE('):
+                        anchor_expr_direct = f"MAXX(ALL('{fact_name}'), {anchor_column})"
+                    else:
+                        anchor_expr_direct = f"MAX('{fact_name}'[{anchor_column}])"
+
+            # 将行计数统一转为 int，便于比较和排序
+            def _coerce_count(value: Any) -> Optional[int]:
+                if value is None:
+                    return None
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+
+            suggested_windows: List[str] = []
+            if _coerce_count(anchor_profile.get('cnt90')):
+                suggested_windows.append('-90D')
+            if _coerce_count(anchor_profile.get('cnt30')):
+                suggested_windows.append('-30D')
+            if _coerce_count(anchor_profile.get('cnt7')):
+                suggested_windows.append('-7D')
+            if not suggested_windows:
+                suggested_windows = ['LM', 'LQ']
+
+            # 推导首选时间窗长度，供 NL2DAX 默认使用
+            window_days = 90 if '-90D' in suggested_windows else (
+                30 if '-30D' in suggested_windows else (
+                    7 if '-7D' in suggested_windows else None
+                )
+            )
+
             facts[fact_name] = {
                 'grain': 'incident' if 'incident' in fact_name else ('task' if 'task' in fact_name else 'fact'),
                 'default_time_key': payload.get('default_time_key'),
                 'default_time_column': anchor_profile.get('anchor_column') or payload.get('default_time_column'),
                 'anchor_strategy': 'max(date_column) fallback max(date by key)',
-                'row_count': facts_rowcount.get(fact_name)
+                'row_count': facts_rowcount.get(fact_name),
+                'anchor_expr_direct': anchor_expr_direct,
+                'anchor_expr_via_key': anchor_expr_via_key,
+                'suggested_windows': suggested_windows
+            }
+
+            time_defaults[fact_name] = {
+                'anchor_column': anchor_column,
+                'dim_table': dim_table_name,
+                'dim_key': dim_key_name,
+                'dim_date_column': dim_date_column,
+                'anchor_expr_direct': anchor_expr_direct,
+                'anchor_expr_via_key': anchor_expr_via_key,
+                'window_days': window_days,
+                'suggested_windows': suggested_windows
             }
 
         dimensions: Dict[str, Any] = {}
@@ -1451,7 +1538,8 @@ TOPN(
             'measures': measures,
             'enums': enums,
             'group_by_suggestions': group_by_suggestions,
-            'warnings': warnings
+            'warnings': warnings,
+            'time_defaults': time_defaults
         }
 
         with open('nl2dax_index.json', 'w', encoding='utf-8') as handle:
@@ -1789,7 +1877,7 @@ TOPN(
             return bool(value)
         except Exception as error:
             print(f"⚠️ _safe_bool 转换失败: {error}")
-            raise
+            return False
 
     @staticmethod
     def _is_auto_date_table(name: Optional[str]) -> bool:
