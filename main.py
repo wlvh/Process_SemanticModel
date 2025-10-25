@@ -589,14 +589,24 @@ class ComprehensiveModelDocumentor:
 
         def _score(column_name: str) -> float:
             lowered = (column_name or '').lower()
-            if 'submitted' in lowered: return 6
-            if 'sent' in lowered:      return 5
-            if 'closed' in lowered:    return 4
-            if 'created' in lowered:   return 3.5
-            if 'resolved' in lowered:  return 3.2
-            if 'calendar' in lowered:  return 3
-            if 'date' in lowered:      return 2
-            return 1
+            base = 1.0
+            if 'submitted' in lowered:
+                base = 6.0
+            elif 'sent' in lowered:
+                base = 5.0
+            elif 'closed' in lowered:
+                base = 4.0
+            elif 'created' in lowered:
+                base = 3.5
+            elif 'resolved' in lowered:
+                base = 3.2
+            elif 'calendar' in lowered:
+                base = 3.0
+            elif 'date' in lowered:
+                base = 2.0
+            if 'time' in lowered and 'date' not in lowered:
+                base -= 0.6
+            return base
 
         date_columns = [
             column.get('column_name')
@@ -610,18 +620,18 @@ class ComprehensiveModelDocumentor:
 EVALUATE
 VAR _min = MINX(ALL('{table}'), '{table}'[{column_name}])
 VAR _max = MAXX(ALL('{table}'), '{table}'[{column_name}])
-VAR _nonblank = COUNTROWS(FILTER(ALL('{table}'), NOT ISBLANK('{table}'[{column_name}])))
-VAR _cnt7  = IF(NOT ISBLANK(_max),
+VAR _nonblank = COUNTROWS(FILTER(ALL('{table}'), NOT(ISBLANK('{table}'[{column_name}]))))
+VAR _cnt7  = IF(NOT(ISBLANK(_max)),
     COUNTROWS(FILTER(ALL('{table}'),
-        NOT ISBLANK('{table}'[{column_name}]) &&
+        NOT(ISBLANK('{table}'[{column_name}])) &&
         '{table}'[{column_name}] > _max - 7  && '{table}'[{column_name}] <= _max)), BLANK())
-VAR _cnt30 = IF(NOT ISBLANK(_max),
+VAR _cnt30 = IF(NOT(ISBLANK(_max)),
     COUNTROWS(FILTER(ALL('{table}'),
-        NOT ISBLANK('{table}'[{column_name}]) &&
+        NOT(ISBLANK('{table}'[{column_name}])) &&
         '{table}'[{column_name}] > _max - 30 && '{table}'[{column_name}] <= _max)), BLANK())
-VAR _cnt90 = IF(NOT ISBLANK(_max),
+VAR _cnt90 = IF(NOT(ISBLANK(_max)),
     COUNTROWS(FILTER(ALL('{table}'),
-        NOT ISBLANK('{table}'[{column_name}]) &&
+        NOT(ISBLANK('{table}'[{column_name}])) &&
         '{table}'[{column_name}] > _max - 90 && '{table}'[{column_name}] <= _max)), BLANK())
 RETURN
 ROW("column","{column_name}","min",_min,"max",_max,"anchor",_max,"nonblank",_nonblank,"cnt7",_cnt7,"cnt30",_cnt30,"cnt90",_cnt90)
@@ -661,34 +671,95 @@ ROW("column","{column_name}","min",_min,"max",_max,"anchor",_max,"nonblank",_non
         key_info = self._detect_default_time_key(table, md)
         if key_info:
             fact_key, dim_table, dim_key = key_info
-            dim_date_column = self._select_dim_date_column(dim_table, md)
-            if dim_date_column:
-                dax_key = f"""
+            fact_dtype = next(
+                (column.get('data_type') for column in md.get('columns', [])
+                 if column.get('table_name') == table and column.get('column_name') == fact_key),
+                None
+            )
+            dim_dtype = next(
+                (column.get('data_type') for column in md.get('columns', [])
+                 if column.get('table_name') == dim_table and column.get('column_name') == dim_key),
+                None
+            )
+            if fact_dtype and dim_dtype and fact_dtype.split()[0].lower() != dim_dtype.split()[0].lower():
+                if self.verbose:
+                    print(f"⚠️ {table}[{fact_key}] 与 {dim_table}[{dim_key}] 类型不一致（{fact_dtype} vs {dim_dtype}），跳过 via-key 锚点。")
+            else:
+                dim_date_column = self._select_dim_date_column(dim_table, md)
+                if dim_date_column:
+                    dax_key = f"""
 EVALUATE
-VAR KeySet = CALCULATETABLE(VALUES('{table}'[{fact_key}]), ALL('{table}'))
-VAR _anchorDate = CALCULATE(MAX('{dim_table}'[{dim_date_column}]), TREATAS(KeySet, '{dim_table}'[{dim_key}]))
-VAR _minDate    = CALCULATE(MIN('{dim_table}'[{dim_date_column}]), TREATAS(KeySet, '{dim_table}'[{dim_key}]))
+VAR KeySet =
+    CALCULATETABLE(VALUES('{table}'[{fact_key}]), ALL('{table}'))
 
-VAR Window90    = IF(NOT ISBLANK(_anchorDate), DATESINPERIOD('{dim_table}'[{dim_date_column}], _anchorDate, -90, DAY))
-VAR KeysInWin   = IF(NOT ISBLANK(_anchorDate), CALCULATETABLE(VALUES('{dim_table}'[{dim_key}]), Window90))
+VAR _anchorDate =
+    CALCULATE(
+        MAX('{dim_table}'[{dim_date_column}]),
+        TREATAS(KeySet, '{dim_table}'[{dim_key}])
+    )
 
-VAR _cnt90 = IF(NOT ISBLANK(_anchorDate),
-    CALCULATE(COUNTROWS('{table}'), TREATAS(KeysInWin, '{table}'[{fact_key}])),
-    BLANK()
-)
-VAR Window30    = IF(NOT ISBLANK(_anchorDate), DATESINPERIOD('{dim_table}'[{dim_date_column}], _anchorDate, -30, DAY))
-VAR KeysInWin30 = IF(NOT ISBLANK(_anchorDate), CALCULATETABLE(VALUES('{dim_table}'[{dim_key}]), Window30))
-VAR _cnt30 = IF(NOT ISBLANK(_anchorDate),
-    CALCULATE(COUNTROWS('{table}'), TREATAS(KeysInWin30, '{table}'[{fact_key}])),
-    BLANK()
-)
-VAR Window7     = IF(NOT ISBLANK(_anchorDate), DATESINPERIOD('{dim_table}'[{dim_date_column}], _anchorDate, -7, DAY))
-VAR KeysInWin7  = IF(NOT ISBLANK(_anchorDate), CALCULATETABLE(VALUES('{dim_table}'[{dim_key}]), Window7))
-VAR _cnt7 = IF(NOT ISBLANK(_anchorDate),
-    CALCULATE(COUNTROWS('{table}'), TREATAS(KeysInWin7, '{table}'[{fact_key}])),
-    BLANK()
-)
-VAR _nonblank = COUNTROWS(FILTER(ALL('{table}'), NOT ISBLANK('{table}'[{fact_key}])))
+VAR _minDate =
+    CALCULATE(
+        MIN('{dim_table}'[{dim_date_column}]),
+        TREATAS(KeySet, '{dim_table}'[{dim_key}])
+    )
+
+VAR _cnt90 =
+    IF(
+        ISBLANK(_anchorDate),
+        BLANK(),
+        VAR KeysInWin =
+            CALCULATETABLE(
+                VALUES('{dim_table}'[{dim_key}]),
+                DATESINPERIOD('{dim_table}'[{dim_date_column}], _anchorDate, -90, DAY)
+            )
+        RETURN
+            CALCULATE(
+                COUNTROWS('{table}'),
+                TREATAS(KeysInWin, '{table}'[{fact_key}])
+            )
+    )
+
+VAR _cnt30 =
+    IF(
+        ISBLANK(_anchorDate),
+        BLANK(),
+        VAR KeysInWin30 =
+            CALCULATETABLE(
+                VALUES('{dim_table}'[{dim_key}]),
+                DATESINPERIOD('{dim_table}'[{dim_date_column}], _anchorDate, -30, DAY)
+            )
+        RETURN
+            CALCULATE(
+                COUNTROWS('{table}'),
+                TREATAS(KeysInWin30, '{table}'[{fact_key}])
+            )
+    )
+
+VAR _cnt7 =
+    IF(
+        ISBLANK(_anchorDate),
+        BLANK(),
+        VAR KeysInWin7 =
+            CALCULATETABLE(
+                VALUES('{dim_table}'[{dim_key}]),
+                DATESINPERIOD('{dim_table}'[{dim_date_column}], _anchorDate, -7, DAY)
+            )
+        RETURN
+            CALCULATE(
+                COUNTROWS('{table}'),
+                TREATAS(KeysInWin7, '{table}'[{fact_key}])
+            )
+    )
+
+VAR _nonblank =
+    COUNTROWS(
+        FILTER(
+            ALL('{table}'),
+            NOT(ISBLANK('{table}'[{fact_key}]))
+        )
+    )
+
 RETURN
 ROW(
     "column", "{fact_key}",
@@ -701,26 +772,26 @@ ROW(
     "cnt90", _cnt90
 )
 """
-                try:
-                    df_key = self.runner.evaluate(dataset=model_name, dax=dax_key, workspace=workspace)
-                    if not df_key.empty:
-                        record = df_key.iloc[0].to_dict()
-                        return {
-                            'anchor_column': record.get('column'),
-                            'min': record.get('min'),
-                            'max': record.get('max'),
-                            'anchor': record.get('anchor'),
-                            'nonblank': int(record.get('nonblank')) if pd.notna(record.get('nonblank')) else None,
-                            'cnt7': int(record.get('cnt7')) if pd.notna(record.get('cnt7')) else None,
-                            'cnt30': int(record.get('cnt30')) if pd.notna(record.get('cnt30')) else None,
-                            'cnt90': int(record.get('cnt90')) if pd.notna(record.get('cnt90')) else None,
-                            'anchor_via_key': True,
-                            'date_dimension': dim_table,
-                            'date_axis_column': dim_date_column
-                        }
-                except Exception as error:
-                    if self.verbose:
-                        print(f"⚠️ 键列 {table}[{fact_key}] 锚点探测失败: {error}")
+                    try:
+                        df_key = self.runner.evaluate(dataset=model_name, dax=dax_key, workspace=workspace)
+                        if not df_key.empty:
+                            record = df_key.iloc[0].to_dict()
+                            return {
+                                'anchor_column': record.get('column'),
+                                'min': record.get('min'),
+                                'max': record.get('max'),
+                                'anchor': record.get('anchor'),
+                                'nonblank': int(record.get('nonblank')) if pd.notna(record.get('nonblank')) else None,
+                                'cnt7': int(record.get('cnt7')) if pd.notna(record.get('cnt7')) else None,
+                                'cnt30': int(record.get('cnt30')) if pd.notna(record.get('cnt30')) else None,
+                                'cnt90': int(record.get('cnt90')) if pd.notna(record.get('cnt90')) else None,
+                                'anchor_via_key': True,
+                                'date_dimension': dim_table,
+                                'date_axis_column': dim_date_column
+                            }
+                    except Exception as error:
+                        if self.verbose:
+                            print(f"⚠️ 键列 {table}[{fact_key}] 锚点探测失败: {error}")
 
         return {
             'anchor_column': date_columns[0] if date_columns else None,
@@ -732,6 +803,31 @@ ROW(
             'cnt30': None,
             'cnt90': None
         }
+
+    def _to_int_or_none(self, value: Any) -> Optional[int]:
+        """安全地将任意输入转换为整数。
+
+        参数:
+            value: 任意待转换的值, 支持标量类型或可转换为整数的字符串。
+
+        返回:
+            若输入可转换为整数则返回对应的 int, 否则返回 None 并输出提示。
+        """
+        if value is None:
+            return None
+        if isinstance(value, float) and pd.isna(value):
+            return None
+        if isinstance(value, str):
+            if value.strip() == '':
+                return None
+        if pd.isna(value):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError) as error:
+            if self.verbose:
+                print(f"⚠️ 无法将值 {value} 转换为整数: {error}")
+            return None
 
     # ---------- Relationship quality checks ----------
     def _relationship_quality_checks(
@@ -801,9 +897,9 @@ ROW(
             try:
                 df_rows = self.runner.evaluate(dataset=model_name, dax=dax_rows, workspace=workspace)
                 if not df_rows.empty:
-                    blank_fk = int(df_rows.iloc[0].get('blank_fk'))
-                    total_rows = int(df_rows.iloc[0].get('total_rows'))
-                    distinct_fk = int(df_rows.iloc[0].get('distinct_fk'))
+                    blank_fk = self._to_int_or_none(df_rows.iloc[0].get('blank_fk'))
+                    total_rows = self._to_int_or_none(df_rows.iloc[0].get('total_rows'))
+                    distinct_fk = self._to_int_or_none(df_rows.iloc[0].get('distinct_fk'))
             except Exception as error:
                 if self.verbose:
                     print(f"⚠️ 无法计算 {from_table}[{from_column}] 的空值统计: {error}")
@@ -827,7 +923,7 @@ ROW(
                 try:
                     df_orphan = self.runner.evaluate(dataset=model_name, dax=dax_orphan, workspace=workspace)
                     if not df_orphan.empty:
-                        orphan_fk = int(df_orphan.iloc[0].get('orphan_fk'))
+                        orphan_fk = self._to_int_or_none(df_orphan.iloc[0].get('orphan_fk'))
                 except Exception as error:
                     if self.verbose:
                         print(f"⚠️ 无法计算 {from_table}[{from_column}] → {to_table}[{to_column}] 的孤儿键: {error}")
