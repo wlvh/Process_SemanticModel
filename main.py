@@ -793,6 +793,57 @@ ROW(
                         if self.verbose:
                             print(f"⚠️ 键列 {table}[{fact_key}] 锚点探测失败: {error}")
 
+        if date_columns:
+            # 使用评分最高的前三个日期列构建 COALESCE 表达式, 兜底生成合成日期锚点
+            top_cols = date_columns[:3]
+            coalesce_expr = "COALESCE(" + ", ".join([f"'{table}'[{column}]" for column in top_cols]) + ")"
+            joined = ', '.join(top_cols)
+            dax_coalesce = f"""
+EVALUATE
+VAR _x =
+    ADDCOLUMNS(
+        ALL('{table}'),
+        "__d", {coalesce_expr}
+    )
+VAR _min = MINX(_x, [__d])
+VAR _max = MAXX(_x, [__d])
+VAR _nonblank = COUNTROWS(FILTER(_x, NOT(ISBLANK([__d]))))
+VAR _cnt7  = IF(NOT(ISBLANK(_max)),
+    COUNTROWS(FILTER(_x, NOT(ISBLANK([__d])) && [__d] > _max - 7  && [__d] <= _max)), BLANK())
+VAR _cnt30 = IF(NOT(ISBLANK(_max)),
+    COUNTROWS(FILTER(_x, NOT(ISBLANK([__d])) && [__d] > _max - 30 && [__d] <= _max)), BLANK())
+VAR _cnt90 = IF(NOT(ISBLANK(_max)),
+    COUNTROWS(FILTER(_x, NOT(ISBLANK([__d])) && [__d] > _max - 90 && [__d] <= _max)), BLANK())
+RETURN
+ROW(
+    "column","COALESCE(" & "{joined}" & ")",
+    "min",_min,"max",_max,"anchor",_max,"nonblank",_nonblank,"cnt7",_cnt7,"cnt30",_cnt30,"cnt90",_cnt90
+)
+"""
+            try:
+                df_coalesce = self.runner.evaluate(dataset=model_name, dax=dax_coalesce, workspace=workspace)
+                if not df_coalesce.empty:
+                    record = df_coalesce.iloc[0].to_dict()
+                    anchor_value = record.get('anchor')
+                    if pd.notna(anchor_value):
+                        if self.verbose:
+                            print(f"ℹ️  使用 COALESCE 作为 {table} 的日期锚点: {joined}")
+                        return {
+                            'anchor_column': record.get('column'),
+                            'min': record.get('min'),
+                            'max': record.get('max'),
+                            'anchor': anchor_value,
+                            'nonblank': self._to_int_or_none(record.get('nonblank')),
+                            'cnt7': self._to_int_or_none(record.get('cnt7')),
+                            'cnt30': self._to_int_or_none(record.get('cnt30')),
+                            'cnt90': self._to_int_or_none(record.get('cnt90')),
+                            'anchor_via_coalesce': True
+                        }
+            except Exception as error:
+                if self.verbose:
+                    print(f"⚠️ COALESCE 锚点探测失败 {table}: {error}")
+
+        # 若所有策略均未获取到有效锚点, 返回空结构供上层显示
         return {
             'anchor_column': date_columns[0] if date_columns else None,
             'min': None,
