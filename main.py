@@ -584,9 +584,10 @@ class ComprehensiveModelDocumentor:
         table: str
     ) -> Dict[str, Any]:
         # ---- 小工具 ----
-        def _dtype_is_date_like(data_type: str) -> bool:
+        def _dtype_is_date(data_type: str) -> bool:
+            """严格判断日期或日期时间类型。"""
             lowered = (data_type or '').lower()
-            return any(flag in lowered for flag in ['date', 'datetime', 'timestamp', 'time'])
+            return any(flag in lowered for flag in ['date', 'datetime', 'timestamp'])
 
         def _score(column_name: str) -> float:
             """日期列优先级：Submitted > Sent > Closed > Created/Resolved > Calendar > Date > 其它；纯 Time 略降权"""
@@ -604,19 +605,17 @@ class ComprehensiveModelDocumentor:
             return base
 
         # 1) 收集候选日期列：先按 DataType，再按列名兜底
-        typed_candidates = [
+        typed_date_cols = [
             c.get('column_name')
             for c in md.get('columns', [])
-            if c.get('table_name') == table and _dtype_is_date_like(c.get('data_type'))
+            if c.get('table_name') == table and _dtype_is_date(c.get('data_type'))
         ]
+        date_cols_direct = sorted(list({dc for dc in typed_date_cols if dc}), key=_score, reverse=True)
         name_candidates = [
             c.get('column_name')
             for c in md.get('columns', [])
             if c.get('table_name') == table and any(k in (c.get('column_name') or '').lower() for k in ['date', 'time'])
         ]
-        date_columns = typed_candidates or name_candidates
-        # 去重+优先级排序
-        date_columns = sorted(list({dc for dc in date_columns if dc}), key=_score, reverse=True)
 
         # 2) 直接用事实表日期列做锚点（逐个尝试）
         def _profile_on_date_column(column_name: str) -> Optional[Dict[str, Any]]:
@@ -658,7 +657,7 @@ ROW("column","{column_name}","min",_min,"max",_max,"anchor",_max,"nonblank",_non
             }
 
         # 先试前 5 个候选（通常足够覆盖 Submitted/Sent/Closed/...）
-        for candidate in date_columns[:5]:
+        for candidate in date_cols_direct[:5]:
             try:
                 profiled = _profile_on_date_column(candidate)
                 if profiled and profiled.get('anchor') is not None:
@@ -674,102 +673,44 @@ ROW("column","{column_name}","min",_min,"max",_max,"anchor",_max,"nonblank",_non
         if key_info:
             fact_key, dim_table, dim_key = key_info
 
-            # 键两侧的数据类型（用于判断是否需要轻度转换）
             fact_dtype = next((c.get('data_type') for c in md.get('columns', [])
                                if c.get('table_name') == table and c.get('column_name') == fact_key), '') or ''
-            dim_dtype  = next((c.get('data_type') for c in md.get('columns', [])
-                               if c.get('table_name') == dim_table and c.get('column_name') == dim_key), '') or ''
-            f_l = fact_dtype.lower(); d_l = dim_dtype.lower()
+            dim_dtype = next((c.get('data_type') for c in md.get('columns', [])
+                              if c.get('table_name') == dim_table and c.get('column_name') == dim_key), '') or ''
+            f_l = fact_dtype.lower()
+            d_l = dim_dtype.lower()
 
             dim_date_column = self._select_dim_date_column(dim_table, md)
             if dim_date_column:
-                # 构造 KeySet 表达式 & 可选的类型收敛
-                # - TEXT→NUM: VALUE()
-                # - NUM→TEXT: FORMAT(...,"0")（假设 DateKey 形如无前导零的纯数字；可按需要改成 "0;-0;0"）
-                keyset_raw = f"CALCULATETABLE(VALUES('{table}'[{fact_key}]), ALL('{table}'))"
-
-                keyset_expr = keyset_raw  # 默认不变
-                try_coerce = False
+                keyraw = f"CALCULATETABLE(VALUES('{table}'[{fact_key}]), ALL('{table}'))"
+                is_fact_text = ('text' in f_l) or ('string' in f_l)
+                is_dim_text = ('text' in d_l) or ('string' in d_l)
+                is_fact_num = any(x in f_l for x in ['int', 'integer', 'decimal', 'double', 'number'])
+                is_dim_num = any(x in d_l for x in ['int', 'integer', 'decimal', 'double', 'number'])
                 if f_l and d_l and f_l.split()[0] != d_l.split()[0]:
-                    # 仅在“文本<->数值”场景尝试轻度收敛，避免其它类型的误伤
-                    is_fact_text = 'text' in f_l or 'string' in f_l
-                    is_dim_text  = 'text' in d_l or 'string' in d_l
-                    is_fact_num  = any(x in f_l for x in ['int', 'integer', 'decimal', 'double', 'number'])
-                    is_dim_num   = any(x in d_l for x in ['int', 'integer', 'decimal', 'double', 'number'])
-
                     if is_fact_text and is_dim_num:
-                        keyset_expr = (
-                            f"SELECTCOLUMNS({keyset_raw}, \"__k\", VALUE('{table}'[{fact_key}]))"
-                        )
-                        try_coerce = True
+                        keyset = f"SELECTCOLUMNS({keyraw}, \"__k\", VALUE('{table}'[{fact_key}]))"
                     elif is_fact_num and is_dim_text:
-                        keyset_expr = (
-                            f"SELECTCOLUMNS({keyset_raw}, \"__k\", FORMAT('{table}'[{fact_key}], \"0\"))"
-                        )
-                        try_coerce = True
+                        keyset = f"SELECTCOLUMNS({keyraw}, \"__k\", FORMAT('{table}'[{fact_key}], \"0\"))"
+                    else:
+                        keyset = f"SELECTCOLUMNS({keyraw}, \"__k\", '{table}'[{fact_key}])"
+                else:
+                    keyset = f"SELECTCOLUMNS({keyraw}, \"__k\", '{table}'[{fact_key}])"
 
                 dax_key = f"""
 EVALUATE
-VAR KeySet = {keyset_expr}
-VAR _anchorDate =
-    CALCULATE(
-        MAX('{dim_table}'[{dim_date_column}]),
-        TREATAS(KeySet, '{dim_table}'[{dim_key}])
+VAR KeySet = {keyset}
+VAR DimMap =
+    SELECTCOLUMNS('{dim_table}',
+        "__k", '{dim_table}'[{dim_key}],
+        "__d", '{dim_table}'[{dim_date_column}]
     )
-VAR _minDate =
-    CALCULATE(
-        MIN('{dim_table}'[{dim_date_column}]),
-        TREATAS(KeySet, '{dim_table}'[{dim_key}])
-    )
-
-VAR _cnt90 =
-    IF(
-        ISBLANK(_anchorDate),
-        BLANK(),
-        VAR KeysInWin =
-            CALCULATETABLE(
-                VALUES('{dim_table}'[{dim_key}]),
-                DATESINPERIOD('{dim_table}'[{dim_date_column}], _anchorDate, -90, DAY)
-            )
-        RETURN
-            CALCULATE(
-                COUNTROWS('{table}'),
-                TREATAS(KeysInWin, '{table}'[{fact_key}])
-            )
-    )
-
-VAR _cnt30 =
-    IF(
-        ISBLANK(_anchorDate),
-        BLANK(),
-        VAR KeysInWin30 =
-            CALCULATETABLE(
-                VALUES('{dim_table}'[{dim_key}]),
-                DATESINPERIOD('{dim_table}'[{dim_date_column}], _anchorDate, -30, DAY)
-            )
-        RETURN
-            CALCULATE(
-                COUNTROWS('{table}'),
-                TREATAS(KeysInWin30, '{table}'[{fact_key}])
-            )
-    )
-
-VAR _cnt7 =
-    IF(
-        ISBLANK(_anchorDate),
-        BLANK(),
-        VAR KeysInWin7 =
-            CALCULATETABLE(
-                VALUES('{dim_table}'[{dim_key}]),
-                DATESINPERIOD('{dim_table}'[{dim_date_column}], _anchorDate, -7, DAY)
-            )
-        RETURN
-            CALCULATE(
-                COUNTROWS('{table}'),
-                TREATAS(KeysInWin7, '{table}'[{fact_key}])
-            )
-    )
-
+VAR J = NATURALINNERJOIN(KeySet, DimMap)
+VAR _anchorDate = MAXX(J, [__d])
+VAR _minDate    = MINX(J, [__d])
+VAR _cnt90 = IF(ISBLANK(_anchorDate), BLANK(), COUNTROWS(FILTER(J, NOT ISBLANK([__d]) && [__d] > _anchorDate - 90 && [__d] <= _anchorDate)))
+VAR _cnt30 = IF(ISBLANK(_anchorDate), BLANK(), COUNTROWS(FILTER(J, NOT ISBLANK([__d]) && [__d] > _anchorDate - 30 && [__d] <= _anchorDate)))
+VAR _cnt7  = IF(ISBLANK(_anchorDate), BLANK(), COUNTROWS(FILTER(J, NOT ISBLANK([__d]) && [__d] > _anchorDate - 7  && [__d] <= _anchorDate)))
 VAR _nonblank =
     COUNTROWS(
         FILTER(
@@ -780,7 +721,7 @@ VAR _nonblank =
 
 RETURN
 ROW(
-    "column", "{fact_key}" & IF({str(try_coerce).upper()}, " (coerced)", ""),
+    "column", "{fact_key}",
     "min", _minDate,
     "max", _anchorDate,
     "anchor", _anchorDate,
@@ -813,8 +754,8 @@ ROW(
                         print(f"⚠️ 键列 {table}[{fact_key}] via-key 锚点探测失败: {e}")
 
         # 4) COALESCE 兜底：把前 3 个日期列合成一个虚拟日期轴
-        if date_columns:
-            top_cols = date_columns[:3]
+        if len(date_cols_direct) >= 2:
+            top_cols = date_cols_direct[:3]
             coalesce_expr = "COALESCE(" + ", ".join([f"'{table}'[{c}]" for c in top_cols]) + ")"
             joined = ', '.join(top_cols)
             dax_coalesce = f"""
@@ -856,7 +797,7 @@ ROW("column","COALESCE(" & "{joined}" & ")", "min",_min,"max",_max,"anchor",_max
 
         # 5) 彻底兜底：仍无锚点则返回空结构（供表格显示）
         return {
-            'anchor_column': date_columns[0] if date_columns else None,
+            'anchor_column': (date_cols_direct[0] if date_cols_direct else (name_candidates[0] if name_candidates else None)),
             'min': None,
             'max': None,
             'anchor': None,
