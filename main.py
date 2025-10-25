@@ -60,6 +60,7 @@ class ComprehensiveModelDocumentor:
         self.compact_mode: bool = True
         self.max_columns_per_table: int = 8
         self.include_measure_dax: bool = False
+        self.show_other_tables_in_main: bool = False
 
     # ---------- Public API ----------
     def generate_complete_documentation(
@@ -607,12 +608,21 @@ class ComprehensiveModelDocumentor:
         def _profile_on_date_column(column_name: str) -> Optional[Dict[str, Any]]:
             dax = f"""
 EVALUATE
-VAR _min = CALCULATE(MIN('{table}'[{column_name}]))
-VAR _max = CALCULATE(MAX('{table}'[{column_name}]))
-VAR _nonblank = COUNTROWS(FILTER('{table}', NOT ISBLANK('{table}'[{column_name}])))
-VAR _cnt7  = IF(NOT ISBLANK(_max), COUNTROWS(FILTER('{table}', NOT ISBLANK('{table}'[{column_name}]) && '{table}'[{column_name}] > _max - 7  && '{table}'[{column_name}] <= _max)), BLANK())
-VAR _cnt30 = IF(NOT ISBLANK(_max), COUNTROWS(FILTER('{table}', NOT ISBLANK('{table}'[{column_name}]) && '{table}'[{column_name}] > _max - 30 && '{table}'[{column_name}] <= _max)), BLANK())
-VAR _cnt90 = IF(NOT ISBLANK(_max), COUNTROWS(FILTER('{table}', NOT ISBLANK('{table}'[{column_name}]) && '{table}'[{column_name}] > _max - 90 && '{table}'[{column_name}] <= _max)), BLANK())
+VAR _min = MINX(ALL('{table}'), '{table}'[{column_name}])
+VAR _max = MAXX(ALL('{table}'), '{table}'[{column_name}])
+VAR _nonblank = COUNTROWS(FILTER(ALL('{table}'), NOT ISBLANK('{table}'[{column_name}])))
+VAR _cnt7  = IF(NOT ISBLANK(_max),
+    COUNTROWS(FILTER(ALL('{table}'),
+        NOT ISBLANK('{table}'[{column_name}]) &&
+        '{table}'[{column_name}] > _max - 7  && '{table}'[{column_name}] <= _max)), BLANK())
+VAR _cnt30 = IF(NOT ISBLANK(_max),
+    COUNTROWS(FILTER(ALL('{table}'),
+        NOT ISBLANK('{table}'[{column_name}]) &&
+        '{table}'[{column_name}] > _max - 30 && '{table}'[{column_name}] <= _max)), BLANK())
+VAR _cnt90 = IF(NOT ISBLANK(_max),
+    COUNTROWS(FILTER(ALL('{table}'),
+        NOT ISBLANK('{table}'[{column_name}]) &&
+        '{table}'[{column_name}] > _max - 90 && '{table}'[{column_name}] <= _max)), BLANK())
 RETURN
 ROW("column","{column_name}","min",_min,"max",_max,"anchor",_max,"nonblank",_nonblank,"cnt7",_cnt7,"cnt30",_cnt30,"cnt90",_cnt90)
 """
@@ -655,60 +665,37 @@ ROW("column","{column_name}","min",_min,"max",_max,"anchor",_max,"nonblank",_non
             if dim_date_column:
                 dax_key = f"""
 EVALUATE
-VAR _validRows = FILTER('{table}', NOT ISBLANK('{table}'[{fact_key}]))
-VAR _anchorDate =
-    CALCULATE(
-        MAX('{dim_table}'[{dim_date_column}]),
-        TREATAS(VALUES('{table}'[{fact_key}]), '{dim_table}'[{dim_key}])
-    )
-VAR _minDate =
-    CALCULATE(
-        MIN('{dim_table}'[{dim_date_column}]),
-        TREATAS(VALUES('{table}'[{fact_key}]), '{dim_table}'[{dim_key}])
-    )
-VAR _cnt7 =
-    IF(
-        NOT ISBLANK(_anchorDate),
-        CALCULATE(
-            COUNTROWS(_validRows),
-            FILTER(
-                _validRows,
-                RELATED('{dim_table}'[{dim_date_column}]) > _anchorDate - 7 &&
-                RELATED('{dim_table}'[{dim_date_column}]) <= _anchorDate
-            )
-        )
-    )
-VAR _cnt30 =
-    IF(
-        NOT ISBLANK(_anchorDate),
-        CALCULATE(
-            COUNTROWS(_validRows),
-            FILTER(
-                _validRows,
-                RELATED('{dim_table}'[{dim_date_column}]) > _anchorDate - 30 &&
-                RELATED('{dim_table}'[{dim_date_column}]) <= _anchorDate
-            )
-        )
-    )
-VAR _cnt90 =
-    IF(
-        NOT ISBLANK(_anchorDate),
-        CALCULATE(
-            COUNTROWS(_validRows),
-            FILTER(
-                _validRows,
-                RELATED('{dim_table}'[{dim_date_column}]) > _anchorDate - 90 &&
-                RELATED('{dim_table}'[{dim_date_column}]) <= _anchorDate
-            )
-        )
-    )
+VAR KeySet = CALCULATETABLE(VALUES('{table}'[{fact_key}]), ALL('{table}'))
+VAR _anchorDate = CALCULATE(MAX('{dim_table}'[{dim_date_column}]), TREATAS(KeySet, '{dim_table}'[{dim_key}]))
+VAR _minDate    = CALCULATE(MIN('{dim_table}'[{dim_date_column}]), TREATAS(KeySet, '{dim_table}'[{dim_key}]))
+
+VAR Window90    = IF(NOT ISBLANK(_anchorDate), DATESINPERIOD('{dim_table}'[{dim_date_column}], _anchorDate, -90, DAY))
+VAR KeysInWin   = IF(NOT ISBLANK(_anchorDate), CALCULATETABLE(VALUES('{dim_table}'[{dim_key}]), Window90))
+
+VAR _cnt90 = IF(NOT ISBLANK(_anchorDate),
+    CALCULATE(COUNTROWS('{table}'), TREATAS(KeysInWin, '{table}'[{fact_key}])),
+    BLANK()
+)
+VAR Window30    = IF(NOT ISBLANK(_anchorDate), DATESINPERIOD('{dim_table}'[{dim_date_column}], _anchorDate, -30, DAY))
+VAR KeysInWin30 = IF(NOT ISBLANK(_anchorDate), CALCULATETABLE(VALUES('{dim_table}'[{dim_key}]), Window30))
+VAR _cnt30 = IF(NOT ISBLANK(_anchorDate),
+    CALCULATE(COUNTROWS('{table}'), TREATAS(KeysInWin30, '{table}'[{fact_key}])),
+    BLANK()
+)
+VAR Window7     = IF(NOT ISBLANK(_anchorDate), DATESINPERIOD('{dim_table}'[{dim_date_column}], _anchorDate, -7, DAY))
+VAR KeysInWin7  = IF(NOT ISBLANK(_anchorDate), CALCULATETABLE(VALUES('{dim_table}'[{dim_key}]), Window7))
+VAR _cnt7 = IF(NOT ISBLANK(_anchorDate),
+    CALCULATE(COUNTROWS('{table}'), TREATAS(KeysInWin7, '{table}'[{fact_key}])),
+    BLANK()
+)
+VAR _nonblank = COUNTROWS(FILTER(ALL('{table}'), NOT ISBLANK('{table}'[{fact_key}])))
 RETURN
 ROW(
     "column", "{fact_key}",
     "min", _minDate,
     "max", _anchorDate,
     "anchor", _anchorDate,
-    "nonblank", COUNTROWS(_validRows),
+    "nonblank", _nonblank,
     "cnt7", _cnt7,
     "cnt30", _cnt30,
     "cnt90", _cnt90
@@ -907,6 +894,21 @@ ROW(
         fact_tables = [n for n, t in table_types.items() if t == 'fact']
         dim_tables  = [n for n, t in table_types.items() if t == 'dimension']
 
+        def _has_measure(metadata: Dict[str, Any], measure_name: str) -> bool:
+            """判断指定度量是否存在且未隐藏。
+
+            参数:
+                metadata: 模型元数据字典。
+                measure_name: 目标度量名称。
+
+            返回:
+                若存在可见度量则返回 True, 否则 False。
+            """
+            for measure in metadata.get('measures', []):
+                if measure.get('measure_name') == measure_name and not self._safe_bool(measure.get('is_hidden')):
+                    return True
+            return False
+
         # pick a fact & a dimension text column
         fact = None
         # Prefer customer survey fact if exists
@@ -998,6 +1000,16 @@ TOPN(
             queue_label = self._select_dimension_label('vwpcse_dimqueue', md) or 'Queue Name'
             anchor_col, anchor_expr_survey = _build_anchor_expression(survey_fact)
             anchor_expr_survey = anchor_expr_survey or f"MAX('{survey_fact}'[{anchor_col or 'SubmittedDate'}])"
+            use_inline_median = not _has_measure(md, 'Median CSAT')
+            median_expr = "[Median CSAT]" if not use_inline_median else (
+                "MEDIANX("
+                "FILTER('vwpcse_factcustomersurvey', NOT ISBLANK('vwpcse_factcustomersurvey'[CsatScore])), "
+                "'vwpcse_factcustomersurvey'[CsatScore])"
+            )
+            anchor_reference = anchor_col or 'SubmittedDate'
+            median_expr_treatas = (
+                f"CALCULATE({median_expr}, TREATAS(Window, '{survey_fact}'[{anchor_reference}]))"
+            )
             dax_active_queue = f"""EVALUATE
 VAR AnchorDate = {anchor_expr_survey}
 VAR Window = DATESINPERIOD('{date_axis_table}'[{date_axis_column}], AnchorDate, -90, DAY)
@@ -1007,7 +1019,7 @@ TOPN(
   SUMMARIZECOLUMNS(
     'vwpcse_dimqueue'[{queue_label}],
     Window,
-    "Median CSAT", [Median CSAT]
+    "Median CSAT", {median_expr}
   ),
   [Median CSAT], DESC
 )"""
@@ -1019,7 +1031,7 @@ TOPN(
   20,
   ADDCOLUMNS(
     VALUES('vwpcse_dimqueue'[{queue_label}]),
-    "Median CSAT", CALCULATE([Median CSAT], TREATAS(Window, '{survey_fact}'[{anchor_col or 'SubmittedDate'}]))
+    "Median CSAT", {median_expr_treatas}
   ),
   [Median CSAT], DESC
 )"""
@@ -1282,11 +1294,8 @@ ROW(
 EVALUATE
 TOPN(
     10,
-    ADDCOLUMNS(
-        SUMMARIZE('{table_name}', '{table_name}'[{column_name}]),
-        "_order", '{table_name}'[{column_name}]
-    ),
-    [_order], ASC
+    SUMMARIZE('{table_name}', '{table_name}'[{column_name}], "cnt", COUNTROWS('{table_name}')),
+    [cnt], DESC
 )
 """
             )
@@ -1321,6 +1330,36 @@ TOPN(
         return index
 
     # ---------- Build Outputs ----------
+    def _prioritize_columns(self, table_name: str, cols: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """按照信息密度对列进行排序，优先输出主键/日期键/外键/标签列。
+
+        参数:
+            table_name: 当前处理的表名，用于可能的表级特判。
+            cols: 列元数据列表。
+
+        返回:
+            调整顺序后的列列表。
+        """
+
+        def _score(column: Dict[str, Any]) -> Tuple[int, int, int, int, int, int]:
+            """计算列优先级分数，值越小越靠前。"""
+            name = (column.get('column_name') or '').lower()
+            dtype = (column.get('data_type') or '').lower()
+            # 主键、唯一键优先
+            is_pk = 0 if self._safe_bool(column.get('is_key')) or self._safe_bool(column.get('is_unique')) else 1
+            # 日期键（DateKey 结尾）次之
+            is_time_key = 0 if name.endswith('datekey') else 1
+            # 日期/时间类型列优先
+            is_date = 0 if any(flag in dtype for flag in ['date', 'datetime', 'timestamp']) else 1
+            # 外键（Key 结尾）
+            is_fk = 0 if name.endswith('key') else 1
+            # 标签列（名称/标题）
+            is_label = 0 if re.search(r'(name|title)$', name) else 1
+            return (is_pk, is_time_key, is_date, is_fk, is_label, len(name))
+
+        sorted_cols = sorted(cols, key=_score)
+        return sorted_cols
+
     def _build_markdown_document(
         self,
         model_name: str,
@@ -1382,14 +1421,20 @@ TOPN(
 
         # 数据结构
         parts.append("## 数据结构\n")
+        suggestions_map = (self.nl2dax_index or {}).get('group_by_suggestions', {})
+        other_tables: List[str] = []
         for t in md.get('business_tables', []):
             tname = t.get('table_name', '')
             ttype = st.get('table_types', {}).get(tname, 'other')
+            if ttype == 'other' and not self.show_other_tables_in_main:
+                other_tables.append(tname)
+                continue
             parts.append(f"### 📊 {tname} ({ttype})")
             if t.get('description'):
                 parts.append(f"*{t['description']}*\n")
 
             tcols = [c for c in md.get('columns', []) if c.get('table_name') == tname and not self._safe_bool(c.get('is_hidden'))]
+            tcols = self._prioritize_columns(tname, tcols)
             if tcols:
                 parts.append("| 列名 | 数据类型 | 说明 | 特性 |")
                 parts.append("|------|----------|------|------|")
@@ -1405,6 +1450,13 @@ TOPN(
                     parts.append(f"| `{name}` | {dtype} | {desc} | {' '.join(feats)} |")
                 if len(tcols) > column_limit:
                     parts.append(f"\n*...还有{len(tcols)-column_limit}个列 (紧凑模式受限于 {self.max_columns_per_table} 列)*")
+            if ttype == 'fact':
+                suggestions = suggestions_map.get(tname, [])[:3]
+                if suggestions:
+                    parts.append("".join([
+                        "*推荐分组列*: ",
+                        ", ".join(f"`{suggestion}`" for suggestion in suggestions)
+                    ]))
             parts.append("")
 
         # 度量
@@ -1473,12 +1525,12 @@ TOPN(
                 for row in summary_rows:
                     blank_ratio_value = row.get('blank_ratio')
                     coverage_value = row.get('coverage')
-                    blank_ratio = '' if blank_ratio_value is None else f"{blank_ratio_value:.2%}"
-                    coverage = '' if coverage_value is None else f"{coverage_value:.2%}"
+                    blank_ratio = 'N/A' if blank_ratio_value is None else f"{blank_ratio_value:.2%}"
+                    coverage = 'N/A' if coverage_value is None else f"{coverage_value:.2%}"
                     blank_fk_value = row.get('blank_fk')
                     orphan_fk_value = row.get('orphan_fk')
-                    blank_fk_text = '' if blank_fk_value is None else str(blank_fk_value)
-                    orphan_fk_text = '' if orphan_fk_value is None else str(orphan_fk_value)
+                    blank_fk_text = 'N/A' if blank_fk_value is None else str(blank_fk_value)
+                    orphan_fk_text = 'N/A' if orphan_fk_value is None else str(orphan_fk_value)
                     parts.append(
                         f"| {row.get('from')} | {row.get('to')} | {blank_ratio} | {coverage} | "
                         f"{row.get('severity','green').upper()} | {blank_fk_text} | {orphan_fk_text} |"
@@ -1562,6 +1614,11 @@ TOPN(
                 parts.append(f"- `{t}` (hidden)")
             if len(md['auto_date_tables']) > 10:
                 parts.append(f"- ...共{len(md['auto_date_tables'])}个")
+        if other_tables:
+            parts.append("### other 类型表一览")
+            parts.append("以下表在主文中隐藏以保持紧凑，可在此处查阅：")
+            for table_name in other_tables:
+                parts.append(f"- `{table_name}`")
         if md.get('errors'):
             parts.append("\n### 取数提示")
             for e in md['errors']:
