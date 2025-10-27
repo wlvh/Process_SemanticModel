@@ -618,11 +618,31 @@ class ComprehensiveModelDocumentor:
             if c.get('table_name') == table and _dtype_is_date(c.get('data_type'))
         ]
         date_cols_direct = sorted(list({dc for dc in typed_date_cols if dc}), key=_score, reverse=True)
-        name_candidates = [
-            c.get('column_name')
-            for c in md.get('columns', [])
-            if c.get('table_name') == table and any(k in (c.get('column_name') or '').lower() for k in ['date', 'time'])
-        ]
+        name_candidates_primary: List[str] = []
+        name_candidates_time_only: List[str] = []
+        for column in md.get('columns', []):
+            if column.get('table_name') != table:
+                continue
+            column_name = column.get('column_name')
+            if not column_name:
+                continue
+            lowered_name = column_name.lower()
+            data_type = column.get('data_type')
+            data_type_lowered = (data_type or '').lower()
+            # 日期或日期时间类型直接加入主候选
+            if 'date' in lowered_name or _dtype_is_date(data_type):
+                if column_name not in name_candidates_primary:
+                    name_candidates_primary.append(column_name)
+                continue
+            # 纯 Time 列延迟尝试，只有在主候选为空时再考虑
+            if 'time' in lowered_name:
+                if any(flag in data_type_lowered for flag in ['date', 'datetime', 'timestamp']):
+                    if column_name not in name_candidates_primary:
+                        name_candidates_primary.append(column_name)
+                else:
+                    if column_name not in name_candidates_time_only:
+                        name_candidates_time_only.append(column_name)
+        name_candidates = name_candidates_primary + name_candidates_time_only
 
         # 2) 直接用事实表日期列做锚点（逐个尝试）
         def _profile_on_date_column(column_name: str) -> Optional[Dict[str, Any]]:
@@ -696,7 +716,7 @@ ROW("column","{column_name}","min",_min,"max",_max,"anchor",_max,"nonblank",_non
                 is_fact_num = any(flag in fact_dtype for flag in num_flags)
                 is_dim_num = any(flag in dim_dtype for flag in num_flags)
 
-                fk_in_row = f"'{table}'[{fact_key}]"
+                fk_in_row = f"[{fact_key}]"
                 if is_fact_text and is_dim_num:
                     fact_to_dim = f"VALUE({fk_in_row})"
                 elif is_fact_num and is_dim_text:
@@ -704,7 +724,7 @@ ROW("column","{column_name}","min",_min,"max",_max,"anchor",_max,"nonblank",_non
                 else:
                     fact_to_dim = fk_in_row
 
-                dim_in_row = f"'{dim_table}'[{dim_key}]"
+                dim_in_row = f"[{dim_key}]"
                 if is_dim_text and is_fact_num:
                     dim_to_fact = f"VALUE({dim_in_row})"
                 elif is_dim_num and is_fact_text:
@@ -714,7 +734,7 @@ ROW("column","{column_name}","min",_min,"max",_max,"anchor",_max,"nonblank",_non
 
                 dax_key = f"""
 EVALUATE
-VAR KeyFact    = CALCULATETABLE(VALUES('{table}'[{fact_key}]), ALL('{table}'))
+VAR KeyFact    = CALCULATETABLE(DISTINCT('{table}'[{fact_key}]), REMOVEFILTERS('{table}'))
 VAR KeySetDim  = SELECTCOLUMNS(KeyFact, "__k", {fact_to_dim})
 VAR AnchorDate =
     CALCULATE(
