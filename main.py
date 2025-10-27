@@ -606,24 +606,28 @@ class ComprehensiveModelDocumentor:
         target_expr = expression or f"'{table}'[{column}]"
         label = (display_column or column or '').replace('"', '""')
 
-        # 基于非空日期构造基础集合, 避免空值导致 MAX/MIN 返回 BLANK。
+        # 通过 ADDCOLUMNS 写入统一的 __value 列, 确保后续比较使用同一数据类型。
+        # 这样即便原始列是文本, 经过 DATETIMEVALUE/DATEVALUE 转换后, 比较操作也始终在数值时间轴上进行。
         return f"""
 EVALUATE
 VAR _base =
-    FILTER(
-        ALL('{table}'),
-        NOT ISBLANK({target_expr})
+    ADDCOLUMNS(
+        FILTER(
+            ALL('{table}'),
+            NOT ISBLANK({target_expr})
+        ),
+        "__value", {target_expr}
     )
-VAR _min = MINX(_base, {target_expr})
-VAR _max = MAXX(_base, {target_expr})
+VAR _min = MINX(_base, [__value])
+VAR _max = MAXX(_base, [__value])
 VAR _cnt7 =
     IF(
         NOT ISBLANK(_max),
         COUNTROWS(
             FILTER(
                 _base,
-                {target_expr} > _max - 7
-                    && {target_expr} <= _max
+                [__value] > _max - 7
+                    && [__value] <= _max
             )
         ),
         BLANK()
@@ -634,8 +638,8 @@ VAR _cnt30 =
         COUNTROWS(
             FILTER(
                 _base,
-                {target_expr} > _max - 30
-                    && {target_expr} <= _max
+                [__value] > _max - 30
+                    && [__value] <= _max
             )
         ),
         BLANK()
@@ -646,8 +650,8 @@ VAR _cnt90 =
         COUNTROWS(
             FILTER(
                 _base,
-                {target_expr} > _max - 90
-                    && {target_expr} <= _max
+                [__value] > _max - 90
+                    && [__value] <= _max
             )
         ),
         BLANK()
