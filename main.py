@@ -583,35 +583,51 @@ class ComprehensiveModelDocumentor:
                 return candidate
         return candidates[0] if candidates else None
 
-    def _dax_profile_on_date_column(self, table: str, column: str) -> str:
+    def _dax_profile_on_date_column(
+        self,
+        table: str,
+        column: str,
+        expression: Optional[str] = None,
+        display_column: Optional[str] = None
+    ) -> str:
         """生成用于日期列体检的 DAX 语句, 仅在非空记录上统计。
 
         参数:
             table: 事实表名称, 需要加单引号引用。
             column: 日期列名称, 必须属于 `table`。
+            expression: 可选的 DAX 表达式, 当原列需要先做类型转换时传入。
+            display_column: 在输出行中展示的列标签, 默认为列名。
 
         返回:
             包含最小日期、最大日期、近 N 天计数等信息的 DAX 查询字符串。
         """
 
-        # 基于非空日期构造基础集合, 避免空值导致 MAX/MIN 返回 BLANK。
+        # expression 为所有计算引用的表达式, 默认为原列。
+        target_expr = expression or f"'{table}'[{column}]"
+        label = (display_column or column or '').replace('"', '""')
+
+        # 通过 ADDCOLUMNS 写入统一的 __value 列, 确保后续比较使用同一数据类型。
+        # 这样即便原始列是文本, 经过 DATETIMEVALUE/DATEVALUE 转换后, 比较操作也始终在数值时间轴上进行。
         return f"""
 EVALUATE
 VAR _base =
-    FILTER(
-        ALL('{table}'),
-        NOT ISBLANK('{table}'[{column}])
+    ADDCOLUMNS(
+        FILTER(
+            ALL('{table}'),
+            NOT ISBLANK({target_expr})
+        ),
+        "__value", {target_expr}
     )
-VAR _min = MINX(_base, '{table}'[{column}])
-VAR _max = MAXX(_base, '{table}'[{column}])
+VAR _min = MINX(_base, [__value])
+VAR _max = MAXX(_base, [__value])
 VAR _cnt7 =
     IF(
         NOT ISBLANK(_max),
         COUNTROWS(
             FILTER(
                 _base,
-                '{table}'[{column}] > _max - 7
-                    && '{table}'[{column}] <= _max
+                [__value] > _max - 7
+                    && [__value] <= _max
             )
         ),
         BLANK()
@@ -622,8 +638,8 @@ VAR _cnt30 =
         COUNTROWS(
             FILTER(
                 _base,
-                '{table}'[{column}] > _max - 30
-                    && '{table}'[{column}] <= _max
+                [__value] > _max - 30
+                    && [__value] <= _max
             )
         ),
         BLANK()
@@ -634,15 +650,15 @@ VAR _cnt90 =
         COUNTROWS(
             FILTER(
                 _base,
-                '{table}'[{column}] > _max - 90
-                    && '{table}'[{column}] <= _max
+                [__value] > _max - 90
+                    && [__value] <= _max
             )
         ),
         BLANK()
     )
 RETURN
 ROW(
-    "column", "{column}",
+    "column", "{label}",
     "min", _min,
     "max", _max,
     "anchor", _max,
@@ -691,20 +707,29 @@ ROW(
 
         anchor_order: List[str] = ['direct', 'via_key', 'coalesce', 'fallback']
 
+        table_columns = [
+            column for column in md.get('columns', []) if column.get('table_name') == table
+        ]
+        normalized_type_map: Dict[str, str] = {}
+        for column in table_columns:
+            column_name = column.get('column_name')
+            if not column_name:
+                continue
+            data_type_value = column.get('data_type') or ''
+            normalized_type_map[column_name] = self._coerce_type(data_type=data_type_value)
+
         # 1) 收集候选日期列：优先真实日期类型, 其次名称包含日期词根。
         typed_date_cols = [
             column.get('column_name')
-            for column in md.get('columns', [])
-            if column.get('table_name') == table and _dtype_is_date(column.get('data_type'))
+            for column in table_columns
+            if _dtype_is_date(column.get('data_type'))
         ]
         typed_date_cols = [column for column in typed_date_cols if column]
         typed_date_cols = sorted(set(typed_date_cols), key=_score, reverse=True)
 
         name_candidates_primary: List[str] = []
         name_candidates_time_only: List[str] = []
-        for column in md.get('columns', []):
-            if column.get('table_name') != table:
-                continue
+        for column in table_columns:
             column_name = column.get('column_name')
             if not column_name:
                 continue
@@ -730,8 +755,20 @@ ROW(
 
         # 2) 直接用事实表日期列做锚点（逐个尝试, 扩展到前 8 个）。
         for candidate in direct_candidates[:8]:
+            column_reference = f"'{table}'[{candidate}]"
+            normalized_type = normalized_type_map.get(candidate, 'text')
+            target_expr = column_reference
+            if normalized_type == 'text':
+                target_expr = f"IFERROR(DATETIMEVALUE({column_reference}), BLANK())"
+                if self.verbose:
+                    print(f"ℹ️ {table}[{candidate}] 为文本列, 尝试用 DATETIMEVALUE + IFERROR 转换后探测锚点…")
             try:
-                dax = self._dax_profile_on_date_column(table=table, column=candidate)
+                dax = self._dax_profile_on_date_column(
+                    table=table,
+                    column=candidate,
+                    expression=target_expr,
+                    display_column=candidate
+                )
                 df_result = self.runner.evaluate(dataset=model_name, dax=dax, workspace=workspace)
                 if df_result.empty:
                     continue
@@ -750,7 +787,7 @@ ROW(
                     'cnt7': self._to_int_or_none(record.get('cnt7')),
                     'cnt30': self._to_int_or_none(record.get('cnt30')),
                     'cnt90': self._to_int_or_none(record.get('cnt90')),
-                    'anchor_expr_direct': f"MAX('{table}'[{candidate}])",
+                    'anchor_expr_direct': f"MAXX(ALL('{table}'), {target_expr})",
                     'anchor_order': anchor_order
                 }
             except Exception as error:
@@ -1049,18 +1086,21 @@ ROW(
         current_type: str,
         target_type: str
     ) -> str:
-        """构造将列值转换为目标类型的 DAX 表达式。"""
+        """构造将列值转换为目标类型的 DAX 表达式, 并通过 IFERROR 兜底非法值。"""
 
         reference = f"'{table}'[{column}]"
         if target_type == 'number':
             if current_type == 'number':
                 return reference
-            return f"VALUE({reference})"
+            return f"IFERROR(VALUE({reference}), BLANK())"
         if target_type == 'text':
             if current_type == 'text':
                 return reference
             return f"FORMAT({reference}, \"0\")"
-        # 日期类型无需转换
+        if target_type == 'date':
+            if current_type == 'date':
+                return reference
+            return f"IFERROR(DATETIMEVALUE({reference}), BLANK())"
         return reference
 
     def _select_join_type(self, left_type: str, right_type: str) -> str:
