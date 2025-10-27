@@ -583,6 +583,88 @@ class ComprehensiveModelDocumentor:
                 return candidate
         return candidates[0] if candidates else None
 
+    def _dax_profile_on_date_column(
+        self,
+        table: str,
+        column: str,
+        expression: Optional[str] = None,
+        display_column: Optional[str] = None
+    ) -> str:
+        """生成用于日期列体检的 DAX 语句, 仅在非空记录上统计。
+
+        参数:
+            table: 事实表名称, 需要加单引号引用。
+            column: 日期列名称, 必须属于 `table`。
+            expression: 可选的 DAX 表达式, 当原列需要先做类型转换时传入。
+            display_column: 在输出行中展示的列标签, 默认为列名。
+
+        返回:
+            包含最小日期、最大日期、近 N 天计数等信息的 DAX 查询字符串。
+        """
+
+        # expression 为所有计算引用的表达式, 默认为原列。
+        target_expr = expression or f"'{table}'[{column}]"
+        label = (display_column or column or '').replace('"', '""')
+
+        # 基于非空日期构造基础集合, 避免空值导致 MAX/MIN 返回 BLANK。
+        return f"""
+EVALUATE
+VAR _base =
+    FILTER(
+        ALL('{table}'),
+        NOT ISBLANK({target_expr})
+    )
+VAR _min = MINX(_base, {target_expr})
+VAR _max = MAXX(_base, {target_expr})
+VAR _cnt7 =
+    IF(
+        NOT ISBLANK(_max),
+        COUNTROWS(
+            FILTER(
+                _base,
+                {target_expr} > _max - 7
+                    && {target_expr} <= _max
+            )
+        ),
+        BLANK()
+    )
+VAR _cnt30 =
+    IF(
+        NOT ISBLANK(_max),
+        COUNTROWS(
+            FILTER(
+                _base,
+                {target_expr} > _max - 30
+                    && {target_expr} <= _max
+            )
+        ),
+        BLANK()
+    )
+VAR _cnt90 =
+    IF(
+        NOT ISBLANK(_max),
+        COUNTROWS(
+            FILTER(
+                _base,
+                {target_expr} > _max - 90
+                    && {target_expr} <= _max
+            )
+        ),
+        BLANK()
+    )
+RETURN
+ROW(
+    "column", "{label}",
+    "min", _min,
+    "max", _max,
+    "anchor", _max,
+    "nonblank", COUNTROWS(_base),
+    "cnt7", _cnt7,
+    "cnt30", _cnt30,
+    "cnt90", _cnt90
+)
+"""
+
     def _profile_time_anchor_for_table(
         self,
         model_name: str,
@@ -590,168 +672,186 @@ class ComprehensiveModelDocumentor:
         md: Dict[str, Any],
         table: str
     ) -> Dict[str, Any]:
-        # ---- 小工具 ----
+        """探测事实表的时间锚点, 返回锚点表达式及统计数据。"""
+        # ---- 小工具：候选列选择 ----
         def _dtype_is_date(data_type: str) -> bool:
             """严格判断日期或日期时间类型。"""
             lowered = (data_type or '').lower()
             return any(flag in lowered for flag in ['date', 'datetime', 'timestamp'])
 
         def _score(column_name: str) -> float:
-            """日期列优先级：Submitted > Sent > Closed > Created/Resolved > Calendar > Date > 其它；纯 Time 略降权"""
+            """根据列名打分, Submitted/Sent/Closed 等优先。"""
             lowered = (column_name or '').lower()
             base = 1.0
-            if 'submitted' in lowered: base = 6.0
-            elif 'sent' in lowered:    base = 5.0
-            elif 'closed' in lowered:  base = 4.0
-            elif 'created' in lowered: base = 3.5
-            elif 'resolved' in lowered:base = 3.2
-            elif 'calendar' in lowered:base = 3.0
-            elif 'date' in lowered:    base = 2.0
+            if 'submitted' in lowered:
+                base = 6.0
+            elif 'sent' in lowered:
+                base = 5.0
+            elif 'closed' in lowered:
+                base = 4.0
+            elif 'created' in lowered:
+                base = 3.5
+            elif 'resolved' in lowered:
+                base = 3.2
+            elif 'calendar' in lowered:
+                base = 3.0
+            elif 'date' in lowered:
+                base = 2.0
             if 'time' in lowered and 'date' not in lowered:
                 base -= 0.6
             return base
 
-        # 1) 收集候选日期列：先按 DataType，再按列名兜底
-        typed_date_cols = [
-            c.get('column_name')
-            for c in md.get('columns', [])
-            if c.get('table_name') == table and _dtype_is_date(c.get('data_type'))
+        anchor_order: List[str] = ['direct', 'via_key', 'coalesce', 'fallback']
+
+        table_columns = [
+            column for column in md.get('columns', []) if column.get('table_name') == table
         ]
-        date_cols_direct = sorted(list({dc for dc in typed_date_cols if dc}), key=_score, reverse=True)
+        normalized_type_map: Dict[str, str] = {}
+        for column in table_columns:
+            column_name = column.get('column_name')
+            if not column_name:
+                continue
+            data_type_value = column.get('data_type') or ''
+            normalized_type_map[column_name] = self._coerce_type(data_type=data_type_value)
+
+        # 1) 收集候选日期列：优先真实日期类型, 其次名称包含日期词根。
+        typed_date_cols = [
+            column.get('column_name')
+            for column in table_columns
+            if _dtype_is_date(column.get('data_type'))
+        ]
+        typed_date_cols = [column for column in typed_date_cols if column]
+        typed_date_cols = sorted(set(typed_date_cols), key=_score, reverse=True)
+
         name_candidates_primary: List[str] = []
         name_candidates_time_only: List[str] = []
-        for column in md.get('columns', []):
-            if column.get('table_name') != table:
-                continue
+        for column in table_columns:
             column_name = column.get('column_name')
             if not column_name:
                 continue
             lowered_name = column_name.lower()
-            data_type = column.get('data_type')
-            data_type_lowered = (data_type or '').lower()
-            # 日期或日期时间类型直接加入主候选
-            if 'date' in lowered_name or _dtype_is_date(data_type):
+            data_type_lowered = (column.get('data_type') or '').lower()
+            if 'date' in lowered_name or _dtype_is_date(column.get('data_type')):
                 if column_name not in name_candidates_primary:
                     name_candidates_primary.append(column_name)
                 continue
-            # 纯 Time 列延迟尝试，只有在主候选为空时再考虑
             if 'time' in lowered_name:
                 if any(flag in data_type_lowered for flag in ['date', 'datetime', 'timestamp']):
                     if column_name not in name_candidates_primary:
                         name_candidates_primary.append(column_name)
-                else:
-                    if column_name not in name_candidates_time_only:
-                        name_candidates_time_only.append(column_name)
+                elif column_name not in name_candidates_time_only:
+                    name_candidates_time_only.append(column_name)
+
         name_candidates = name_candidates_primary + name_candidates_time_only
 
-        # 2) 直接用事实表日期列做锚点（逐个尝试）
-        def _profile_on_date_column(column_name: str) -> Optional[Dict[str, Any]]:
-            dax = f"""
-EVALUATE
-VAR _min = MINX(ALL('{table}'), '{table}'[{column_name}])
-VAR _max = MAXX(ALL('{table}'), '{table}'[{column_name}])
-VAR _nonblank = COUNTROWS(FILTER(ALL('{table}'), NOT(ISBLANK('{table}'[{column_name}]))))
-VAR _cnt7  = IF(NOT(ISBLANK(_max)),
-    COUNTROWS(FILTER(ALL('{table}'),
-        NOT(ISBLANK('{table}'[{column_name}])) &&
-        '{table}'[{column_name}] > _max - 7  && '{table}'[{column_name}] <= _max)), BLANK())
-VAR _cnt30 = IF(NOT(ISBLANK(_max)),
-    COUNTROWS(FILTER(ALL('{table}'),
-        NOT(ISBLANK('{table}'[{column_name}])) &&
-        '{table}'[{column_name}] > _max - 30 && '{table}'[{column_name}] <= _max)), BLANK())
-VAR _cnt90 = IF(NOT(ISBLANK(_max)),
-    COUNTROWS(FILTER(ALL('{table}'),
-        NOT(ISBLANK('{table}'[{column_name}])) &&
-        '{table}'[{column_name}] > _max - 90 && '{table}'[{column_name}] <= _max)), BLANK())
-RETURN
-ROW("column","{column_name}","min",_min,"max",_max,"anchor",_max,"nonblank",_nonblank,"cnt7",_cnt7,"cnt30",_cnt30,"cnt90",_cnt90)
-"""
-            df_result = self.runner.evaluate(dataset=model_name, dax=dax, workspace=workspace)
-            if df_result.empty:
-                return None
-            rec = df_result.iloc[0].to_dict()
-            if pd.isna(rec.get('anchor')):
-                return None
-            return {
-                'anchor_column': rec.get('column'),
-                'min': rec.get('min'),
-                'max': rec.get('max'),
-                'anchor': rec.get('anchor'),
-                'nonblank': self._to_int_or_none(rec.get('nonblank')),
-                'cnt7': self._to_int_or_none(rec.get('cnt7')),
-                'cnt30': self._to_int_or_none(rec.get('cnt30')),
-                'cnt90': self._to_int_or_none(rec.get('cnt90'))
-            }
+        direct_candidates: List[str] = []
+        for candidate in typed_date_cols + name_candidates:
+            if candidate not in direct_candidates:
+                direct_candidates.append(candidate)
 
-        # 先试前 5 个候选（通常足够覆盖 Submitted/Sent/Closed/...）
-        for candidate in date_cols_direct[:5]:
-            try:
-                profiled = _profile_on_date_column(candidate)
-                if profiled and profiled.get('anchor') is not None:
-                    return profiled
-                elif self.verbose and profiled is None:
-                    print(f"ℹ️ {table}[{candidate}] 无有效锚点，继续尝试…")
-            except Exception as e:
+        # 2) 直接用事实表日期列做锚点（逐个尝试, 扩展到前 8 个）。
+        for candidate in direct_candidates[:8]:
+            column_reference = f"'{table}'[{candidate}]"
+            normalized_type = normalized_type_map.get(candidate, 'text')
+            target_expr = column_reference
+            if normalized_type == 'text':
+                target_expr = f"DATETIMEVALUE({column_reference})"
                 if self.verbose:
-                    print(f"⚠️ 日期列 {table}[{candidate}] 锚点探测失败: {e}")
+                    print(f"ℹ️ {table}[{candidate}] 为文本列, 尝试用 DATETIMEVALUE 转换后探测锚点…")
+            try:
+                dax = self._dax_profile_on_date_column(
+                    table=table,
+                    column=candidate,
+                    expression=target_expr,
+                    display_column=candidate
+                )
+                df_result = self.runner.evaluate(dataset=model_name, dax=dax, workspace=workspace)
+                if df_result.empty:
+                    continue
+                record = df_result.iloc[0].to_dict()
+                if pd.isna(record.get('anchor')):
+                    if self.verbose:
+                        print(f"ℹ️ {table}[{candidate}] 无有效锚点，继续尝试…")
+                    continue
+                return {
+                    'anchor_column': record.get('column'),
+                    'anchor_reference_column': candidate,
+                    'min': record.get('min'),
+                    'max': record.get('max'),
+                    'anchor': record.get('anchor'),
+                    'nonblank': self._to_int_or_none(record.get('nonblank')),
+                    'cnt7': self._to_int_or_none(record.get('cnt7')),
+                    'cnt30': self._to_int_or_none(record.get('cnt30')),
+                    'cnt90': self._to_int_or_none(record.get('cnt90')),
+                    'anchor_expr_direct': f"MAXX(ALL('{table}'), {target_expr})",
+                    'anchor_order': anchor_order
+                }
+            except Exception as error:
+                if self.verbose:
+                    print(f"⚠️ 日期列 {table}[{candidate}] 锚点探测失败: {error}")
 
-        # 3) via-key：用 DimDate + 键映射（回到 TREATAS 写法），并对两端做轻度类型自适配
+        # 3) via-key：用 DimDate + 键映射, 强制过滤空值并处理类型差异。
         key_info = self._detect_default_time_key(table, md)
         if key_info:
             fact_key, dim_table, dim_key = key_info
-
-            fact_dtype = (next((c.get('data_type') for c in md.get('columns', [])
-                                if c.get('table_name') == table and c.get('column_name') == fact_key), '') or '').lower()
-            dim_dtype = (next((c.get('data_type') for c in md.get('columns', [])
-                               if c.get('table_name') == dim_table and c.get('column_name') == dim_key), '') or '').lower()
+            fact_dtype = (next(
+                (
+                    column.get('data_type')
+                    for column in md.get('columns', [])
+                    if column.get('table_name') == table and column.get('column_name') == fact_key
+                ),
+                ''
+            ) or '').lower()
+            dim_dtype = (next(
+                (
+                    column.get('data_type')
+                    for column in md.get('columns', [])
+                    if column.get('table_name') == dim_table and column.get('column_name') == dim_key
+                ),
+                ''
+            ) or '').lower()
 
             dim_date_column = self._select_dim_date_column(dim_table, md)
             if dim_date_column:
-                is_fact_text = ('text' in fact_dtype) or ('string' in fact_dtype)
-                is_dim_text = ('text' in dim_dtype) or ('string' in dim_dtype)
-                num_flags = [
-                    'int', 'integer', 'whole number', 'decimal',
-                    'double', 'number', 'currency', 'fixed decimal'
-                ]
-                is_fact_num = any(flag in fact_dtype for flag in num_flags)
-                is_dim_num = any(flag in dim_dtype for flag in num_flags)
-
-                fk_in_row = f"[{fact_key}]"
-                if is_fact_text and is_dim_num:
-                    fact_to_dim = f"VALUE({fk_in_row})"
-                elif is_fact_num and is_dim_text:
-                    fact_to_dim = f"FORMAT({fk_in_row}, \"0\")"
-                else:
-                    fact_to_dim = fk_in_row
-
-                dim_in_row = f"[{dim_key}]"
-                if is_dim_text and is_fact_num:
-                    dim_to_fact = f"VALUE({dim_in_row})"
-                elif is_dim_num and is_fact_text:
-                    dim_to_fact = f"FORMAT({dim_in_row}, \"0\")"
-                else:
-                    dim_to_fact = dim_in_row
+                fact_type = self._coerce_type(data_type=fact_dtype)
+                dim_type = self._coerce_type(data_type=dim_dtype)
+                fact_to_dim = self._coerce_expr(
+                    table=table,
+                    column=fact_key,
+                    current_type=fact_type,
+                    target_type=dim_type
+                )
+                dim_to_fact = self._coerce_expr(
+                    table=dim_table,
+                    column=dim_key,
+                    current_type=dim_type,
+                    target_type=fact_type
+                )
 
                 dax_key = f"""
 EVALUATE
-VAR KeyFact    = CALCULATETABLE(DISTINCT('{table}'[{fact_key}]), REMOVEFILTERS('{table}'))
-VAR KeySetDim  = SELECTCOLUMNS(KeyFact, "__k", {fact_to_dim})
+VAR KeyFact =
+    SELECTCOLUMNS(
+        FILTER(
+            VALUES('{table}'[{fact_key}]),
+            NOT ISBLANK({fact_to_dim})
+        ),
+        "__k", {fact_to_dim}
+    )
 VAR AnchorDate =
     CALCULATE(
         MAX('{dim_table}'[{dim_date_column}]),
-        TREATAS(KeySetDim, '{dim_table}'[{dim_key}])
+        TREATAS(KeyFact, '{dim_table}'[{dim_key}])
     )
 VAR MinDate =
     CALCULATE(
         MIN('{dim_table}'[{dim_date_column}]),
-        TREATAS(KeySetDim, '{dim_table}'[{dim_key}])
+        TREATAS(KeyFact, '{dim_table}'[{dim_key}])
     )
-
-/* 在 DimDate 上取窗口，再把键“转换回”事实表类型，应用到事实表做计数 */
 VAR Win90Dim =
-    CALCULATETABLE (
+    CALCULATETABLE(
         VALUES('{dim_table}'[{dim_key}]),
-        FILTER (
+        FILTER(
             ALL('{dim_table}'[{dim_date_column}]),
             NOT ISBLANK(AnchorDate)
                 && '{dim_table}'[{dim_date_column}] > AnchorDate - 90
@@ -759,9 +859,9 @@ VAR Win90Dim =
         )
     )
 VAR Win30Dim =
-    CALCULATETABLE (
+    CALCULATETABLE(
         VALUES('{dim_table}'[{dim_key}]),
-        FILTER (
+        FILTER(
             ALL('{dim_table}'[{dim_date_column}]),
             NOT ISBLANK(AnchorDate)
                 && '{dim_table}'[{dim_date_column}] > AnchorDate - 30
@@ -769,34 +869,28 @@ VAR Win30Dim =
         )
     )
 VAR Win7Dim =
-    CALCULATETABLE (
+    CALCULATETABLE(
         VALUES('{dim_table}'[{dim_key}]),
-        FILTER (
+        FILTER(
             ALL('{dim_table}'[{dim_date_column}]),
             NOT ISBLANK(AnchorDate)
                 && '{dim_table}'[{dim_date_column}] > AnchorDate - 7
                 && '{dim_table}'[{dim_date_column}] <= AnchorDate
         )
     )
-
 VAR Win90Fact = SELECTCOLUMNS(Win90Dim, "__k", {dim_to_fact})
 VAR Win30Fact = SELECTCOLUMNS(Win30Dim, "__k", {dim_to_fact})
 VAR Win7Fact  = SELECTCOLUMNS(Win7Dim,  "__k", {dim_to_fact})
-
 VAR Cnt90 = CALCULATE(COUNTROWS('{table}'), TREATAS(Win90Fact, '{table}'[{fact_key}]))
 VAR Cnt30 = CALCULATE(COUNTROWS('{table}'), TREATAS(Win30Fact, '{table}'[{fact_key}]))
 VAR Cnt7  = CALCULATE(COUNTROWS('{table}'), TREATAS(Win7Fact , '{table}'[{fact_key}]))
-
-VAR NonBlankFK =
-    COUNTROWS(FILTER(ALL('{table}'), NOT ISBLANK('{table}'[{fact_key}])))
-
 RETURN
 ROW(
     "column", "{fact_key}",
     "min", MinDate,
     "max", AnchorDate,
     "anchor", AnchorDate,
-    "nonblank", NonBlankFK,
+    "nonblank", COUNTROWS(KeyFact),
     "cnt7", Cnt7,
     "cnt30", Cnt30,
     "cnt90", Cnt90
@@ -805,77 +899,141 @@ ROW(
                 try:
                     df_key = self.runner.evaluate(dataset=model_name, dax=dax_key, workspace=workspace)
                     if not df_key.empty:
-                        rec = df_key.iloc[0].to_dict()
-                        if pd.notna(rec.get('anchor')):
+                        record = df_key.iloc[0].to_dict()
+                        if pd.notna(record.get('anchor')):
+                            anchor_expr_via_key = (
+                                "CALCULATE(" +
+                                f"MAX('{dim_table}'[{dim_date_column}]), " +
+                                "TREATAS(" +
+                                "SELECTCOLUMNS(" +
+                                f"FILTER(VALUES('{table}'[{fact_key}]), NOT ISBLANK({fact_to_dim})), \"__k\", {fact_to_dim}), " +
+                                f"'{dim_table}'[{dim_key}]" +
+                                ")" +
+                                ")"
+                            )
                             return {
-                                'anchor_column': rec.get('column'),
-                                'min': rec.get('min'),
-                                'max': rec.get('max'),
-                                'anchor': rec.get('anchor'),
-                                'nonblank': self._to_int_or_none(rec.get('nonblank')),
-                                'cnt7': self._to_int_or_none(rec.get('cnt7')),
-                                'cnt30': self._to_int_or_none(rec.get('cnt30')),
-                                'cnt90': self._to_int_or_none(rec.get('cnt90')),
+                                'anchor_column': record.get('column'),
+                                'anchor_reference_column': fact_key,
+                                'min': record.get('min'),
+                                'max': record.get('max'),
+                                'anchor': record.get('anchor'),
+                                'nonblank': self._to_int_or_none(record.get('nonblank')),
+                                'cnt7': self._to_int_or_none(record.get('cnt7')),
+                                'cnt30': self._to_int_or_none(record.get('cnt30')),
+                                'cnt90': self._to_int_or_none(record.get('cnt90')),
                                 'anchor_via_key': True,
+                                'anchor_expr_via_key': anchor_expr_via_key,
                                 'date_dimension': dim_table,
-                                'date_axis_column': dim_date_column
+                                'date_axis_column': dim_date_column,
+                                'anchor_order': anchor_order
                             }
-                except Exception as e:
+                except Exception as error:
                     if self.verbose:
-                        print(f"⚠️ 键列 {table}[{fact_key}] via-key 锚点探测失败: {e}")
+                        print(f"⚠️ 键列 {table}[{fact_key}] via-key 锚点探测失败: {error}")
 
-        # 4) COALESCE 兜底：仅使用真实日期类型列，防止整数 DateKey 混入
-        if len(date_cols_direct) >= 2:
-            top_cols = date_cols_direct[:3]
-            coalesce_expr = "COALESCE(" + ", ".join([f"'{table}'[{c}]" for c in top_cols]) + ")"
-            joined = ', '.join(top_cols)
+        # 4) COALESCE 兜底：组合多个日期列, 同样过滤空值。
+        if len(typed_date_cols) >= 2:
+            coalesce_columns = typed_date_cols[:3]
+            coalesce_expr = "COALESCE(" + ", ".join([f"'{table}'[{column}]" for column in coalesce_columns]) + ")"
             dax_coalesce = f"""
 EVALUATE
-VAR _x = ADDCOLUMNS(ALL('{table}'), "__d", {coalesce_expr})
-VAR _min = MINX(_x, [__d])
-VAR _max = MAXX(_x, [__d])
-VAR _nonblank = COUNTROWS(FILTER(_x, NOT(ISBLANK([__d]))))
-VAR _cnt7  = IF(NOT(ISBLANK(_max)),
-    COUNTROWS(FILTER(_x, NOT(ISBLANK([__d])) && [__d] > _max - 7  && [__d] <= _max)), BLANK())
-VAR _cnt30 = IF(NOT(ISBLANK(_max)),
-    COUNTROWS(FILTER(_x, NOT(ISBLANK([__d])) && [__d] > _max - 30 && [__d] <= _max)), BLANK())
-VAR _cnt90 = IF(NOT(ISBLANK(_max)),
-    COUNTROWS(FILTER(_x, NOT(ISBLANK([__d])) && [__d] > _max - 90 && [__d] <= _max)), BLANK())
+VAR _base =
+    ADDCOLUMNS(
+        ALL('{table}'),
+        "__d", {coalesce_expr}
+    )
+VAR _filtered = FILTER(_base, NOT ISBLANK([__d]))
+VAR _min = MINX(_filtered, [__d])
+VAR _max = MAXX(_filtered, [__d])
+VAR _cnt7 =
+    IF(
+        NOT ISBLANK(_max),
+        COUNTROWS(
+            FILTER(
+                _filtered,
+                [__d] > _max - 7 && [__d] <= _max
+            )
+        ),
+        BLANK()
+    )
+VAR _cnt30 =
+    IF(
+        NOT ISBLANK(_max),
+        COUNTROWS(
+            FILTER(
+                _filtered,
+                [__d] > _max - 30 && [__d] <= _max
+            )
+        ),
+        BLANK()
+    )
+VAR _cnt90 =
+    IF(
+        NOT ISBLANK(_max),
+        COUNTROWS(
+            FILTER(
+                _filtered,
+                [__d] > _max - 90 && [__d] <= _max
+            )
+        ),
+        BLANK()
+    )
 RETURN
-ROW("column","COALESCE(" & "{joined}" & ")", "min",_min,"max",_max,"anchor",_max,"nonblank",_nonblank,"cnt7",_cnt7,"cnt30",_cnt30,"cnt90",_cnt90)
+ROW(
+    "column", "{coalesce_expr}",
+    "min", _min,
+    "max", _max,
+    "anchor", _max,
+    "nonblank", COUNTROWS(_filtered),
+    "cnt7", _cnt7,
+    "cnt30", _cnt30,
+    "cnt90", _cnt90
+)
 """
             try:
-                df_c = self.runner.evaluate(dataset=model_name, dax=dax_coalesce, workspace=workspace)
-                if not df_c.empty:
-                    rec = df_c.iloc[0].to_dict()
-                    if pd.notna(rec.get('anchor')):
+                df_coalesce = self.runner.evaluate(dataset=model_name, dax=dax_coalesce, workspace=workspace)
+                if not df_coalesce.empty:
+                    record = df_coalesce.iloc[0].to_dict()
+                    if pd.notna(record.get('anchor')):
                         if self.verbose:
+                            joined = ', '.join(coalesce_columns)
                             print(f"ℹ️ 使用 COALESCE 作为 {table} 的日期锚点: {joined}")
                         return {
-                            'anchor_column': rec.get('column'),
-                            'min': rec.get('min'),
-                            'max': rec.get('max'),
-                            'anchor': rec.get('anchor'),
-                            'nonblank': self._to_int_or_none(rec.get('nonblank')),
-                            'cnt7': self._to_int_or_none(rec.get('cnt7')),
-                            'cnt30': self._to_int_or_none(rec.get('cnt30')),
-                            'cnt90': self._to_int_or_none(rec.get('cnt90')),
-                            'anchor_via_coalesce': True
+                            'anchor_column': record.get('column'),
+                            'anchor_reference_column': coalesce_columns[0],
+                            'min': record.get('min'),
+                            'max': record.get('max'),
+                            'anchor': record.get('anchor'),
+                            'nonblank': self._to_int_or_none(record.get('nonblank')),
+                            'cnt7': self._to_int_or_none(record.get('cnt7')),
+                            'cnt30': self._to_int_or_none(record.get('cnt30')),
+                            'cnt90': self._to_int_or_none(record.get('cnt90')),
+                            'anchor_via_coalesce': True,
+                            'anchor_expr_coalesce': f"MAXX(ALL('{table}'), {coalesce_expr})",
+                            'anchor_order': anchor_order
                         }
-            except Exception as e:
+            except Exception as error:
                 if self.verbose:
-                    print(f"⚠️ COALESCE 锚点探测失败 {table}: {e}")
+                    print(f"⚠️ COALESCE 锚点探测失败 {table}: {error}")
 
-        # 5) 彻底兜底：仍无锚点则返回空结构（供表格显示）
+        # 5) 彻底兜底：返回结构占位, 供上层继续兜底。
+        fallback_column = None
+        if direct_candidates:
+            fallback_column = direct_candidates[0]
+        elif name_candidates:
+            fallback_column = name_candidates[0]
+
         return {
-            'anchor_column': (date_cols_direct[0] if date_cols_direct else (name_candidates[0] if name_candidates else None)),
+            'anchor_column': fallback_column,
+            'anchor_reference_column': fallback_column,
             'min': None,
             'max': None,
             'anchor': None,
             'nonblank': None,
             'cnt7': None,
             'cnt30': None,
-            'cnt90': None
+            'cnt90': None,
+            'anchor_order': anchor_order
         }
 
     def _to_int_or_none(self, value: Any) -> Optional[int]:
@@ -902,6 +1060,51 @@ ROW("column","COALESCE(" & "{joined}" & ")", "min",_min,"max",_max,"anchor",_max
             if self.verbose:
                 print(f"⚠️ 无法将值 {value} 转换为整数: {error}")
             return None
+
+    def _coerce_type(self, data_type: str) -> str:
+        """将数据类型归一到 number/text/date 三大类。"""
+
+        lowered = (data_type or '').lower()
+        number_flags = [
+            'int', 'integer', 'whole number', 'decimal', 'double', 'fixed decimal', 'currency', 'number'
+        ]
+        date_flags = ['date', 'datetime', 'timestamp', 'time']
+        if any(flag in lowered for flag in number_flags):
+            return 'number'
+        if any(flag in lowered for flag in date_flags):
+            return 'date'
+        return 'text'
+
+    def _coerce_expr(
+        self,
+        table: str,
+        column: str,
+        current_type: str,
+        target_type: str
+    ) -> str:
+        """构造将列值转换为目标类型的 DAX 表达式。"""
+
+        reference = f"'{table}'[{column}]"
+        if target_type == 'number':
+            if current_type == 'number':
+                return reference
+            return f"VALUE({reference})"
+        if target_type == 'text':
+            if current_type == 'text':
+                return reference
+            return f"FORMAT({reference}, \"0\")"
+        # 日期类型无需转换
+        return reference
+
+    def _select_join_type(self, left_type: str, right_type: str) -> str:
+        """根据左右列类型决定孤儿检查的统一目标类型。"""
+
+        # 日期类型优先保持日期处理, 否则优先使用数字, 最后退回文本。
+        if 'date' in {left_type, right_type}:
+            return 'date'
+        if 'number' in {left_type, right_type}:
+            return 'number'
+        return 'text'
 
     # ---------- Relationship quality checks ----------
     def _relationship_quality_checks(
@@ -952,7 +1155,22 @@ ROW("column","COALESCE(" & "{joined}" & ")", "min",_min,"max",_max,"anchor",_max
 
             dtype_from = (col_type.get((from_table, from_column)) or '')
             dtype_to = (col_type.get((to_table, to_column)) or '')
-            can_check_orphan = bool(dtype_from) and bool(dtype_to) and dtype_from.split()[0] == dtype_to.split()[0]
+            type_from = self._coerce_type(data_type=dtype_from)
+            type_to = self._coerce_type(data_type=dtype_to)
+            target_type = self._select_join_type(left_type=type_from, right_type=type_to)
+            type_mismatch = type_from != type_to
+            fk_expr = self._coerce_expr(
+                table=from_table,
+                column=from_column,
+                current_type=type_from,
+                target_type=target_type
+            )
+            pk_expr = self._coerce_expr(
+                table=to_table,
+                column=to_column,
+                current_type=type_to,
+                target_type=target_type
+            )
 
             dax_rows = (
                 f"""
@@ -979,32 +1197,47 @@ ROW(
                     print(f"⚠️ 无法计算 {from_table}[{from_column}] 的空值统计: {error}")
 
             orphan_fk = None
-            if can_check_orphan:
-                dax_orphan = (
-                    f"""
+            dax_orphan = (
+                f"""
 EVALUATE
 VAR FKVals =
-    FILTER(VALUES('{from_table}'[{from_column}]), NOT ISBLANK('{from_table}'[{from_column}]))
+    SELECTCOLUMNS(
+        FILTER(
+            VALUES('{from_table}'[{from_column}]),
+            NOT ISBLANK({fk_expr})
+        ),
+        "__k", {fk_expr}
+    )
 VAR PKVals =
-    FILTER(VALUES('{to_table}'[{to_column}]), NOT ISBLANK('{to_table}'[{to_column}]))
+    SELECTCOLUMNS(
+        FILTER(
+            VALUES('{to_table}'[{to_column}]),
+            NOT ISBLANK({pk_expr})
+        ),
+        "__k", {pk_expr}
+    )
 RETURN
 ROW(
     "orphan_fk",
     COUNTROWS(EXCEPT(FKVals, PKVals))
 )
 """
-                )
-                try:
-                    df_orphan = self.runner.evaluate(dataset=model_name, dax=dax_orphan, workspace=workspace)
-                    if not df_orphan.empty:
-                        orphan_fk = self._to_int_or_none(df_orphan.iloc[0].get('orphan_fk'))
-                except Exception as error:
-                    if self.verbose:
-                        print(f"⚠️ 无法计算 {from_table}[{from_column}] → {to_table}[{to_column}] 的孤儿键: {error}")
-            else:
+            )
+            try:
+                df_orphan = self.runner.evaluate(dataset=model_name, dax=dax_orphan, workspace=workspace)
+                if not df_orphan.empty:
+                    orphan_fk = self._to_int_or_none(df_orphan.iloc[0].get('orphan_fk'))
+            except Exception as error:
+                if self.verbose:
+                    print(f"⚠️ 无法计算 {from_table}[{from_column}] → {to_table}[{to_column}] 的孤儿键: {error}")
+
+            if type_mismatch:
                 lints.append({
                     'type': 'lint',
-                    'message': f"关系 {from_table}[{from_column}] → {to_table}[{to_column}] 两端数据类型不同（{dtype_from} vs {dtype_to}），无法做孤儿检查，建议统一类型。"
+                    'message': (
+                        f"关系 {from_table}[{from_column}] → {to_table}[{to_column}] 存在类型差异（{dtype_from} ↔ {dtype_to}），"  # noqa: E501
+                        f"已按 {target_type} 自动比对，建议在模型层统一类型。"
+                    )
                 })
 
             blank_ratio = None
@@ -1035,7 +1268,9 @@ ROW(
                 'orphan_fk': orphan_fk,
                 'blank_ratio': blank_ratio,
                 'coverage': coverage,
-                'severity': severity
+                'severity': severity,
+                'type_mismatch': type_mismatch,
+                'comparison_type': target_type
             }
             details.append(detail_entry)
 
@@ -1126,20 +1361,36 @@ ROW(
             date_axis_column = self._select_dim_date_column(date_axis_table, md)
 
         def _build_anchor_expression(fact_name: str) -> Tuple[str, str]:
+            """根据锚点顺序生成可直接 COALESCE 的表达式。"""
+
             anchor_info = (profiles or {}).get('time_anchors', {}).get(fact_name, {})
-            anchor_column = anchor_info.get('anchor_column')
+            anchor_column = anchor_info.get('anchor_reference_column') or anchor_info.get('anchor_column')
             if not anchor_column:
                 return '', ''
-            if anchor_info.get('anchor_via_key'):
-                dim_table = anchor_info.get('date_dimension') or date_axis_table
-                dim_date_col = anchor_info.get('date_axis_column') or date_axis_column
-                dim_key_col = date_axis_key
-                expression = (
-                    f"CALCULATE(MAX('{dim_table}'[{dim_date_col}]), "
-                    f"TREATAS(VALUES('{fact_name}'[{anchor_column}]), '{dim_table}'[{dim_key_col}]))"
-                )
-                return anchor_column, expression
-            return anchor_column, f"MAX('{fact_name}'[{anchor_column}])"
+            dim_table = anchor_info.get('date_dimension') or date_axis_table
+            dim_date_col = anchor_info.get('date_axis_column') or date_axis_column
+            fallback_expr = None
+            if dim_table and dim_date_col:
+                fallback_expr = f"MAX('{dim_table}'[{dim_date_col}])"
+            order = anchor_info.get('anchor_order') or ['direct', 'via_key', 'coalesce', 'fallback']
+            candidate_map = {
+                'direct': anchor_info.get('anchor_expr_direct'),
+                'via_key': anchor_info.get('anchor_expr_via_key'),
+                'coalesce': anchor_info.get('anchor_expr_coalesce'),
+                'fallback': fallback_expr
+            }
+            expressions: List[str] = []
+            for key in order:
+                expr = candidate_map.get(key)
+                if expr and expr not in expressions:
+                    expressions.append(expr)
+            if fallback_expr and fallback_expr not in expressions:
+                expressions.append(fallback_expr)
+            if not expressions:
+                return anchor_column, fallback_expr or ''
+            if len(expressions) == 1:
+                return anchor_column, expressions[0]
+            return anchor_column, f"COALESCE({', '.join(expressions)})"
 
         incident_fact = 'vwpcse_factincident_closed'
         if incident_fact in fact_tables and date_axis_table and date_axis_column:
@@ -1352,28 +1603,68 @@ ROW(
             anchor_profile = time_anchors.get(fact_name, {})
             # 聚合锚点相关的关键字段，优先使用数据体检结果，其次退回结构分析推断
             anchor_column = anchor_profile.get('anchor_column') or payload.get('default_time_column')
+            anchor_reference_column = anchor_profile.get('anchor_reference_column') or anchor_column
             dim_table_name = anchor_profile.get('date_dimension') or payload.get('date_dimension')
             dim_key_name = anchor_profile.get('date_dimension_key') or payload.get('date_dimension_key')
             dim_date_column = anchor_profile.get('date_axis_column') or (
                 self._select_dim_date_column(dim_table_name, md) if dim_table_name else None
             )
 
-            anchor_expr_direct: Optional[str] = None
-            anchor_expr_via_key: Optional[str] = None
-            # 根据锚点探测路径生成可直接复用的 DAX 表达式
-            if anchor_profile.get('anchor_via_key'):
+            anchor_expr_direct: Optional[str] = anchor_profile.get('anchor_expr_direct')
+            anchor_expr_via_key: Optional[str] = anchor_profile.get('anchor_expr_via_key')
+            anchor_expr_coalesce: Optional[str] = anchor_profile.get('anchor_expr_coalesce')
+            anchor_order: List[str] = anchor_profile.get('anchor_order') or ['direct', 'via_key', 'coalesce', 'fallback']
+
+            if not anchor_expr_via_key and payload.get('default_time_key') and dim_table_name and dim_key_name and dim_date_column:
                 fact_key_name = payload.get('default_time_key')
-                if fact_key_name and dim_table_name and dim_key_name and dim_date_column:
-                    anchor_expr_via_key = (
-                        f"CALCULATE(MAX('{dim_table_name}'[{dim_date_column}]), "
-                        f"TREATAS(VALUES('{fact_name}'[{fact_key_name}]), '{dim_table_name}'[{dim_key_name}]))"
-                    )
-            else:
-                if anchor_column:
-                    if isinstance(anchor_column, str) and anchor_column.upper().startswith('COALESCE('):
-                        anchor_expr_direct = f"MAXX(ALL('{fact_name}'), {anchor_column})"
-                    else:
-                        anchor_expr_direct = f"MAX('{fact_name}'[{anchor_column}])"
+                fact_dtype = (next(
+                    (
+                        column.get('data_type')
+                        for column in md.get('columns', [])
+                        if column.get('table_name') == fact_name and column.get('column_name') == fact_key_name
+                    ),
+                    ''
+                ) or '').lower()
+                dim_dtype = (next(
+                    (
+                        column.get('data_type')
+                        for column in md.get('columns', [])
+                        if column.get('table_name') == dim_table_name and column.get('column_name') == dim_key_name
+                    ),
+                    ''
+                ) or '').lower()
+                fact_type = self._coerce_type(data_type=fact_dtype)
+                dim_type = self._coerce_type(data_type=dim_dtype)
+                fact_to_dim_expr = self._coerce_expr(
+                    table=fact_name,
+                    column=fact_key_name,
+                    current_type=fact_type,
+                    target_type=dim_type
+                )
+                anchor_expr_via_key = (
+                    "CALCULATE(" +
+                    f"MAX('{dim_table_name}'[{dim_date_column}]), " +
+                    "TREATAS(" +
+                    "SELECTCOLUMNS(" +
+                    f"FILTER(VALUES('{fact_name}'[{fact_key_name}]), NOT ISBLANK({fact_to_dim_expr})), \"__k\", {fact_to_dim_expr}), " +
+                    f"'{dim_table_name}'[{dim_key_name}]" +
+                    ")" +
+                    ")"
+                )
+
+            fallback_dim_table = dim_table_name or default_dim_table
+            fallback_dim_date_column = dim_date_column or default_dim_date_column
+            anchor_expr_fallback: Optional[str] = None
+            if fallback_dim_table and fallback_dim_date_column:
+                anchor_expr_fallback = f"MAX('{fallback_dim_table}'[{fallback_dim_date_column}])"
+
+            anchor_block = {
+                'direct': anchor_expr_direct,
+                'via_key': anchor_expr_via_key,
+                'coalesce': anchor_expr_coalesce,
+                'fallback': anchor_expr_fallback,
+                'order': anchor_order
+            }
 
             # 将行计数统一转为 int，便于比较和排序
             def _coerce_count(value: Any) -> Optional[int]:
@@ -1404,21 +1695,27 @@ ROW(
             facts[fact_name] = {
                 'grain': 'incident' if 'incident' in fact_name else ('task' if 'task' in fact_name else 'fact'),
                 'default_time_key': payload.get('default_time_key'),
-                'default_time_column': anchor_profile.get('anchor_column') or payload.get('default_time_column'),
-                'anchor_strategy': 'max(date_column) fallback max(date by key)',
+                'default_time_column': anchor_column,
+                'anchor_strategy': 'direct → via_key → coalesce → fallback',
                 'row_count': facts_rowcount.get(fact_name),
-                'anchor_expr_direct': anchor_expr_direct,
-                'anchor_expr_via_key': anchor_expr_via_key,
-                'suggested_windows': suggested_windows
+                'time': {
+                    'anchor': dict(anchor_block),
+                    'reference_column': anchor_reference_column,
+                    'date_dimension': dim_table_name,
+                    'date_dimension_key': dim_key_name,
+                    'date_axis_column': dim_date_column,
+                    'windows': suggested_windows,
+                    'preferred_window_days': window_days
+                }
             }
 
             time_defaults[fact_name] = {
                 'anchor_column': anchor_column,
+                'reference_column': anchor_reference_column,
                 'dim_table': dim_table_name,
                 'dim_key': dim_key_name,
                 'dim_date_column': dim_date_column,
-                'anchor_expr_direct': anchor_expr_direct,
-                'anchor_expr_via_key': anchor_expr_via_key,
+                'anchor': dict(anchor_block),
                 'window_days': window_days,
                 'suggested_windows': suggested_windows
             }
@@ -1456,19 +1753,34 @@ ROW(
                 None
             )
             friendly_name = table_name.replace('vwpcse_', '') if table_name else ''
-            synonyms = self._expand_synonyms(label_column or friendly_name)
+            alias_variants = self._expand_synonyms(label_column or friendly_name)
+            alias_target = None
+            if label_column:
+                alias_target = f"{table_name}[{label_column}]"
+            elif primary_key:
+                alias_target = f"{table_name}[{primary_key}]"
+            elif columns:
+                alias_target = f"{table_name}[{columns[0].get('column_name')}]"
+            alias_map = {variant: alias_target for variant in alias_variants if alias_target}
             dimensions[table_name] = {
                 'primary_key': primary_key,
                 'natural_key': natural_key,
                 'label': label_column,
-                'synonyms': synonyms
+                'aliases': alias_map,
+                'alias_target': alias_target
             }
         if 'vwpcse_dimqueue' in dimensions:
-            dimensions['vwpcse_dimqueue']['label'] = dimensions['vwpcse_dimqueue'].get('label') or 'Queue Name'
-            existing_synonyms = dimensions['vwpcse_dimqueue'].get('synonyms', [])
-            queue_synonyms = sorted({*existing_synonyms, '队列', 'Queue', '队列名称'})
-            dimensions['vwpcse_dimqueue']['synonyms'] = queue_synonyms
-            dimensions['vwpcse_dimqueue']['join_recommendation'] = 'Prefer QueueKey; QueueID only for Task facts'
+            dim_queue = dimensions['vwpcse_dimqueue']
+            dim_queue['label'] = dim_queue.get('label') or 'Queue Name'
+            alias_target = dim_queue.get('alias_target') or f"vwpcse_dimqueue[{dim_queue.get('label') or 'Queue Name'}]"
+            alias_map = dim_queue.get('aliases', {})
+            for alias in ['队列', 'Queue', '队列名称']:
+                if alias_target:
+                    alias_map.setdefault(alias, alias_target)
+            dim_queue['aliases'] = alias_map
+            dim_queue['join_recommendation'] = 'Prefer QueueKey; QueueID only for Task facts'
+        for dim_entry in dimensions.values():
+            dim_entry.pop('alias_target', None)
 
         group_by_suggestions: Dict[str, List[str]] = {}
         for fact_name, schema in st.get('star_schema', {}).items():
@@ -1487,13 +1799,45 @@ ROW(
                 group_by_suggestions[fact_name] = suggestions[:5]
 
         relationships: List[Dict[str, Any]] = []
+        column_types: Dict[Tuple[str, str], str] = {
+            (column.get('table_name'), column.get('column_name')): (column.get('data_type') or '')
+            for column in md.get('columns', [])
+        }
+        default_time_keys_map = {
+            fact_name: payload.get('default_time_key')
+            for fact_name, payload in fact_time_axes.items()
+        }
         for relationship in md.get('relationships', []):
             if not self._is_business_relationship(relationship):
                 continue
+            from_table = relationship.get('from_table')
+            from_column = relationship.get('from_column')
+            to_table = relationship.get('to_table')
+            to_column = relationship.get('to_column')
+            is_active = self._safe_bool(relationship.get('is_active'))
+            dtype_from = column_types.get((from_table, from_column), '')
+            dtype_to = column_types.get((to_table, to_column), '')
+            type_mismatch = self._coerce_type(data_type=dtype_from) != self._coerce_type(data_type=dtype_to)
+            relationship_call = (
+                f"USERELATIONSHIP('{from_table}'[{from_column}], '{to_table}'[{to_column}])"
+                if from_table and from_column and to_table and to_column else None
+            )
+            userelationship_hint = None
+            default_key = default_time_keys_map.get(from_table)
+            if not is_active and relationship_call:
+                if default_key and default_key != from_column:
+                    userelationship_hint = (
+                        f"默认活动键为 {default_key}；按 {from_column} 口径分析时调用 {relationship_call}。"
+                    )
+                else:
+                    userelationship_hint = f"该关系为非活动状态；需要时调用 {relationship_call}。"
             relationships.append({
-                'from': f"{relationship.get('from_table')}[{relationship.get('from_column')}]",
-                'to': f"{relationship.get('to_table')}[{relationship.get('to_column')}]",
-                'direction': relationship.get('cross_filter_direction', 'Single')
+                'from': f"{from_table}[{from_column}]",
+                'to': f"{to_table}[{to_column}]",
+                'direction': relationship.get('cross_filter_direction', 'Single'),
+                'inactive': not is_active,
+                'type_mismatch': type_mismatch,
+                'userelationship_hint': userelationship_hint
             })
 
         measures: Dict[str, Any] = {}
@@ -1551,6 +1895,7 @@ TOPN(
             warnings.append('DimQueue has dual keys (QueueKey & QueueID). Prefer QueueKey for model-wide consistency.')
 
         index = {
+            'version': '2.0',
             'date_axis': date_axis,
             'facts': facts,
             'dimensions': dimensions,
@@ -1776,6 +2121,15 @@ TOPN(
                 parts.append("\n**模型提示**")
                 for message in lint_msgs:
                     parts.append(f"- {message}")
+            inactive_relations = [
+                rel for rel in (self.nl2dax_index or {}).get('relationships', [])
+                if rel.get('inactive')
+            ]
+            if inactive_relations:
+                parts.append("\n**非活动关系与 USERELATIONSHIP 建议**")
+                for rel in inactive_relations:
+                    hint_text = rel.get('userelationship_hint') or '此关系为非活动状态，按需使用 USERELATIONSHIP() 激活过滤。'
+                    parts.append(f"- `{rel.get('from')} → {rel.get('to')}`: {hint_text}")
             parts.append(f"\n*已过滤 {filtered_auto} 条自动日期表关系（详见附录）*")
         parts.append("")
 
@@ -1816,7 +2170,7 @@ TOPN(
                          f"{self.nl2dax_index.get('date_axis', {}).get('date_column')}] ↔ "
                          f"{self.nl2dax_index.get('date_axis', {}).get('key_column')}")
             parts.append("- **事实表摘要**: 提供默认时间键、锚点策略、行数等信息")
-            parts.append("- **维度展示列**: label/synonym 信息已收录，供 NL2DAX 快速对齐术语")
+            parts.append("- **维度展示列**: label 与 aliases 映射已收录，供 NL2DAX 快速对齐术语")
             parts.append("- **推荐分组列**: group_by_suggestions 提供事实表常用维度字段")
             parts.append("- **度量依赖图**: depends_on 字段列出所引用的度量与列")
             parts.append("- **文件位置**: `nl2dax_index.json` (与本文档同目录)\n")
