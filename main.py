@@ -607,7 +607,7 @@ class ComprehensiveModelDocumentor:
         label = (display_column or column or '').replace('"', '""')
 
         # 通过 ADDCOLUMNS 写入统一的 __value 列, 确保后续比较使用同一数据类型。
-        # 这样即便原始列是文本, 经过 DATETIMEVALUE/DATEVALUE 转换后, 比较操作也始终在数值时间轴上进行。
+        # 这样即便原始列是文本, 经过 VALUE/DATEVALUE 转换后, 比较操作也始终在数值时间轴上进行。
         return f"""
 EVALUATE
 VAR _base =
@@ -759,9 +759,9 @@ ROW(
             normalized_type = normalized_type_map.get(candidate, 'text')
             target_expr = column_reference
             if normalized_type == 'text':
-                target_expr = f"IFERROR(DATETIMEVALUE({column_reference}), BLANK())"
+                target_expr = f"IFERROR(VALUE({column_reference}), BLANK())"
                 if self.verbose:
-                    print(f"ℹ️ {table}[{candidate}] 为文本列, 尝试用 DATETIMEVALUE + IFERROR 转换后探测锚点…")
+                    print(f"ℹ️ {table}[{candidate}] 为文本列, 尝试用 VALUE + IFERROR 转换后探测锚点…")
             try:
                 dax = self._dax_profile_on_date_column(
                     table=table,
@@ -1100,7 +1100,7 @@ ROW(
         if target_type == 'date':
             if current_type == 'date':
                 return reference
-            return f"IFERROR(DATETIMEVALUE({reference}), BLANK())"
+            return f"IFERROR(VALUE({reference}), BLANK())"
         return reference
 
     def _select_join_type(self, left_type: str, right_type: str) -> str:
