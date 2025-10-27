@@ -606,26 +606,29 @@ class ComprehensiveModelDocumentor:
         target_expr = expression or f"'{table}'[{column}]"
         label = (display_column or column or '').replace('"', '""')
 
-        # 通过 ADDCOLUMNS 写入统一的 __value 列, 确保后续比较使用同一数据类型。
-        # 这样即便原始列是文本, 经过 VALUE/DATEVALUE 转换后, 比较操作也始终在数值时间轴上进行。
+        # 通过 ADDCOLUMNS 写入统一的 __value 列, 再统一过滤空值。
+        # 这样即便原始列需要复杂的 VAR 逻辑, 也能在一个位置完成类型转换和清洗。
         return f"""
 EVALUATE
 VAR _base =
     ADDCOLUMNS(
-        FILTER(
-            ALL('{table}'),
-            NOT ISBLANK({target_expr})
-        ),
-        "__value", {target_expr}
+        ALL('{table}'),
+        "__value",
+        {target_expr}
     )
-VAR _min = MINX(_base, [__value])
-VAR _max = MAXX(_base, [__value])
+VAR _filtered =
+    FILTER(
+        _base,
+        NOT ISBLANK([__value])
+    )
+VAR _min = MINX(_filtered, [__value])
+VAR _max = MAXX(_filtered, [__value])
 VAR _cnt7 =
     IF(
         NOT ISBLANK(_max),
         COUNTROWS(
             FILTER(
-                _base,
+                _filtered,
                 [__value] > _max - 7
                     && [__value] <= _max
             )
@@ -637,7 +640,7 @@ VAR _cnt30 =
         NOT ISBLANK(_max),
         COUNTROWS(
             FILTER(
-                _base,
+                _filtered,
                 [__value] > _max - 30
                     && [__value] <= _max
             )
@@ -649,7 +652,7 @@ VAR _cnt90 =
         NOT ISBLANK(_max),
         COUNTROWS(
             FILTER(
-                _base,
+                _filtered,
                 [__value] > _max - 90
                     && [__value] <= _max
             )
@@ -662,7 +665,7 @@ ROW(
     "min", _min,
     "max", _max,
     "anchor", _max,
-    "nonblank", COUNTROWS(_base),
+    "nonblank", COUNTROWS(_filtered),
     "cnt7", _cnt7,
     "cnt30", _cnt30,
     "cnt90", _cnt90
@@ -759,9 +762,9 @@ ROW(
             normalized_type = normalized_type_map.get(candidate, 'text')
             target_expr = column_reference
             if normalized_type == 'text':
-                target_expr = f"IFERROR(VALUE({column_reference}), BLANK())"
+                target_expr = self._build_text_datetime_expr(table=table, column=candidate)
                 if self.verbose:
-                    print(f"ℹ️ {table}[{candidate}] 为文本列, 尝试用 VALUE + IFERROR 转换后探测锚点…")
+                    print(f"ℹ️ {table}[{candidate}] 为文本列, 尝试用 DATEVALUE/TIMEVALUE 解析后探测锚点…")
             try:
                 dax = self._dax_profile_on_date_column(
                     table=table,
@@ -1079,6 +1082,31 @@ ROW(
             return 'date'
         return 'text'
 
+    def _build_text_datetime_expr(self, table: str, column: str) -> str:
+        """构造可复用的 DAX 片段, 将文本列安全解析为日期时间序列。
+
+        参数:
+            table: 列所属表名, 将直接用于 `'<table>'` 引用。
+            column: 列名, 将直接用于 `[{column}]` 引用。
+
+        返回:
+            结合 DATEVALUE 与 TIMEVALUE 的 DAX 表达式字符串, 包含必要的 VAR 变量与空值兜底。
+        """
+
+        reference = f"'{table}'[{column}]"
+        return (
+            "VAR __raw = TRIM(" + reference + ")\n"
+            "VAR __blank = OR(ISBLANK(__raw), __raw = \"\")\n"
+            "VAR __normalized = SUBSTITUTE(SUBSTITUTE(__raw, \"T\", \" \"), \"Z\", \"\")\n"
+            "VAR __spacePos = SEARCH(\" \", __normalized, 1, 0)\n"
+            "VAR __dateText = IF(__spacePos > 0, LEFT(__normalized, __spacePos - 1), __normalized)\n"
+            "VAR __timeText = IF(__spacePos > 0, MID(__normalized, __spacePos + 1, LEN(__normalized)), BLANK())\n"
+            "VAR __dateValue = IF(__blank, BLANK(), IFERROR(DATEVALUE(__dateText), BLANK()))\n"
+            "VAR __timeValue = IF(__blank, BLANK(), IF(__timeText = BLANK(), BLANK(), IFERROR(TIMEVALUE(__timeText), BLANK())))\n"
+            "RETURN\n"
+            "    IF(ISBLANK(__dateValue), BLANK(), __dateValue + IF(ISBLANK(__timeValue), 0, __timeValue))"
+        )
+
     def _coerce_expr(
         self,
         table: str,
@@ -1100,7 +1128,9 @@ ROW(
         if target_type == 'date':
             if current_type == 'date':
                 return reference
-            return f"IFERROR(VALUE({reference}), BLANK())"
+            if current_type == 'number':
+                return reference
+            return self._build_text_datetime_expr(table=table, column=column)
         return reference
 
     def _select_join_type(self, left_type: str, right_type: str) -> str:
