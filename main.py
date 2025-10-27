@@ -759,9 +759,9 @@ ROW(
             normalized_type = normalized_type_map.get(candidate, 'text')
             target_expr = column_reference
             if normalized_type == 'text':
-                target_expr = f"DATETIMEVALUE({column_reference})"
+                target_expr = f"IFERROR(DATETIMEVALUE({column_reference}), BLANK())"
                 if self.verbose:
-                    print(f"ℹ️ {table}[{candidate}] 为文本列, 尝试用 DATETIMEVALUE 转换后探测锚点…")
+                    print(f"ℹ️ {table}[{candidate}] 为文本列, 尝试用 DATETIMEVALUE + IFERROR 转换后探测锚点…")
             try:
                 dax = self._dax_profile_on_date_column(
                     table=table,
@@ -1086,18 +1086,21 @@ ROW(
         current_type: str,
         target_type: str
     ) -> str:
-        """构造将列值转换为目标类型的 DAX 表达式。"""
+        """构造将列值转换为目标类型的 DAX 表达式, 并通过 IFERROR 兜底非法值。"""
 
         reference = f"'{table}'[{column}]"
         if target_type == 'number':
             if current_type == 'number':
                 return reference
-            return f"VALUE({reference})"
+            return f"IFERROR(VALUE({reference}), BLANK())"
         if target_type == 'text':
             if current_type == 'text':
                 return reference
             return f"FORMAT({reference}, \"0\")"
-        # 日期类型无需转换
+        if target_type == 'date':
+            if current_type == 'date':
+                return reference
+            return f"IFERROR(DATETIMEVALUE({reference}), BLANK())"
         return reference
 
     def _select_join_type(self, left_type: str, right_type: str) -> str:
