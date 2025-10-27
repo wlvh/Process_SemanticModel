@@ -21,12 +21,20 @@ LLMModelDocLite — 语义模型“轻文档 + 数据探索”生成器（单文
 """
 
 from __future__ import annotations
+import datetime as dt
 import re
 import json
 import time
 from typing import Any, Dict, List, Optional, Protocol, Tuple, Set
 
 import pandas as pd
+
+try:
+    import numpy as np
+    _NUMPY_AVAILABLE = True
+except ImportError:
+    np = None
+    _NUMPY_AVAILABLE = False
 
 # ----------------------------
 # 可选：Fabric SDK
@@ -110,7 +118,7 @@ class LLMModelDocLite:
             include_enums=include_enums,
             max_enum_values=max_enum_values
         )
-        return json.dumps(contract, ensure_ascii=False, indent=2)
+        return self._json_dumps(contract)
 
     # ======== 元数据提取 ========
     def _fetch_metadata(self, model_name: str, workspace: Optional[str]) -> Dict[str, Any]:
@@ -391,7 +399,14 @@ ROW(
                     df = self.runner.evaluate(model_name, dax, workspace)
                     if not df.empty and pd.notna(df.iloc[0].get("anchor")):
                         r = df.iloc[0].to_dict()
-                        payload.update({k: (int(v) if k.startswith("cnt") and v is not None else v) for k, v in r.items()})
+                        payload.update({
+                            "min": self._to_iso(r.get("min")),
+                            "max": self._to_iso(r.get("max")),
+                            "anchor": self._to_iso(r.get("anchor")),
+                            "cnt7": self._to_int(r.get("cnt7")),
+                            "cnt30": self._to_int(r.get("cnt30")),
+                            "cnt90": self._to_int(r.get("cnt90"))
+                        })
                         payload["source"] = "via_key"
                 except Exception:
                     pass
@@ -420,7 +435,14 @@ ROW(
                         df = self.runner.evaluate(model_name, dax, workspace)
                         if not df.empty and pd.notna(df.iloc[0].get("anchor")):
                             r = df.iloc[0].to_dict()
-                            payload.update({k: (int(v) if k.startswith("cnt") and v is not None else v) for k, v in r.items()})
+                            payload.update({
+                                "min": self._to_iso(r.get("min")),
+                                "max": self._to_iso(r.get("max")),
+                                "anchor": self._to_iso(r.get("anchor")),
+                                "cnt7": self._to_int(r.get("cnt7")),
+                                "cnt30": self._to_int(r.get("cnt30")),
+                                "cnt90": self._to_int(r.get("cnt90"))
+                            })
                             payload["source"] = "direct"
                     except Exception:
                         pass
@@ -430,8 +452,10 @@ ROW(
                 try:
                     df = self.runner.evaluate(model_name, f"EVALUATE ROW(\"anchor\", MAX('{dim_table}'[{dim_date}]))", workspace)
                     if not df.empty:
-                        payload["anchor"] = df.iloc[0, 0]
-                        payload["max"] = df.iloc[0, 0]
+                        v = df.iloc[0, 0]
+                        iso = self._to_iso(v)
+                        payload["anchor"] = iso
+                        payload["max"] = iso
                         payload["source"] = "fallback"
                 except Exception:
                     pass
@@ -650,6 +674,83 @@ TOPN({max_enum_values},
             return bool(v)
         except Exception:
             return False
+
+    @staticmethod
+    def _to_iso(value: Any) -> Optional[str]:
+        """将多种日期/时间对象标准化为 ISO8601 字符串。
+
+        Args:
+            value: 任意待序列化对象，常见为 pandas.Timestamp、datetime、numpy.datetime64。
+
+        Returns:
+            可直接写入 JSON 的 ISO8601 字符串；若无法识别则返回 str(value)。
+        """
+        # None 直接返回，保持数据缺失语义。
+        if value is None:
+            return None
+
+        # 先处理 pandas.Timestamp，兼容 NaT。
+        if isinstance(value, pd.Timestamp):
+            if pd.isna(value):
+                return None
+            return value.to_pydatetime().isoformat()
+
+        # 处理 Python 原生日期/时间类型。
+        if isinstance(value, (dt.datetime, dt.date)):
+            return value.isoformat()
+
+        # 处理 NumPy datetime64（若可用）。
+        if _NUMPY_AVAILABLE and isinstance(value, np.datetime64):
+            ts = pd.Timestamp(value)
+            if pd.isna(ts):
+                return None
+            return ts.to_pydatetime().isoformat()
+
+        # 兜底：转成字符串，避免 json.dumps 失败。
+        return str(value)
+
+    @staticmethod
+    def _json_dumps(obj: Any) -> str:
+        """序列化 JSON，同时安全处理时间对象与 NumPy 标量。
+
+        Args:
+            obj: 任意可被 JSON 序列化的数据结构。
+
+        Returns:
+            经过缩进与非 ASCII 友好设置的 JSON 字符串。
+        """
+
+        def _default(o: Any) -> Any:
+            """default 回调：降级处理特殊对象。"""
+            # pandas.Timestamp，含 NaT。
+            if isinstance(o, pd.Timestamp):
+                if pd.isna(o):
+                    return None
+                return o.to_pydatetime().isoformat()
+
+            # Python datetime/date。
+            if isinstance(o, (dt.datetime, dt.date)):
+                return o.isoformat()
+
+            # NumPy 标量（数字/布尔/时间）。
+            if _NUMPY_AVAILABLE:
+                if isinstance(o, np.integer):
+                    return int(o)
+                if isinstance(o, np.floating):
+                    return float(o)
+                if isinstance(o, np.bool_):
+                    return bool(o)
+                if isinstance(o, np.datetime64):
+                    return LLMModelDocLite._to_iso(o)
+
+            # 其他对象如果提供 isoformat()，尝试调用。
+            if hasattr(o, "isoformat") and callable(o.isoformat):
+                return o.isoformat()
+
+            # 最后兜底转成字符串。
+            return str(o)
+
+        return json.dumps(obj, ensure_ascii=False, indent=2, default=_default)
 
     @staticmethod
     def _to_int(x: Any) -> Optional[int]:
