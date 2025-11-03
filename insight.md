@@ -186,3 +186,147 @@
 
       * *假设：* 积压工单（Open Cases）的平均时长（Avg Open Age）正在增长，并且特定问题正导致过多的升级（Escalation）。
       * *目标：* 监控积压风险，并定位导致问题升级（如T3 Bugs）的热点区域。
+
+---
+
+## ① DSAT 降低 30 天冲刺（Stop the Bleeding）— **86%**
+
+**North‑Star KPI**：`% DSAT(1,2)`（或 `% DSAT(1,2,3)`）；**对照**：`CPE CSAT`、`% FCR`、`% Resolution Rate`
+**涉及事实**：`vwpcse_factcustomersurvey`（主），联动 `incident_created`（首响）与 `opencasedaily`（超龄）
+
+### 闭环（Sense → Diagnose → Decide → Act → Verify）
+
+* **Sense（高层一屏）**：
+
+  * 月度 `MonthName` 维度：`% DSAT(1,2)`、`# CSAT Response`。
+  * 分布对照：`CPE CSAT`、`% FCR`。
+* **Diagnose（深度优先路径）**：
+
+  1. `Country` or `Product Name` or Other → 选出 **DSAT 最高的 Top3 国家**；
+  2. 进入该国按 `Product Name` → 选 Top3；
+  3. 进入产品按 `Queue Name` → 选 Top3；
+  4. 进入队列按 `RootPath` → 锁定**贡献 80% DSAT 的根因**；
+  5. 对该叶子组合联表：
+
+     * 首响：`IRHour@P75`（`incident_created`）；
+     * 在手：`% Open > 14 days`、`Avg Open Age`（`opencasedaily`）；
+     * 解决能力：`% FCR`、`% Resolution Rate`（survey）。
+       **停止条件**：叶子组合覆盖**≥80%**的 DSAT 超标差额，或样本数量 `# CSAT Response` < 30。
+* **Decide（策略模板）**：
+
+  * 若 `IRHour@P75` 超阈 → **排班/首响 SLA 加固**；
+  * 若 `%>14d` 高 → **绿色通道 + 周度清零**；
+  * 若 `FCR` 低 → **知识卡/决策树补齐**；
+  * 若特定 `RootPath` 集中 → **专项缺陷/流程治理**。
+
+* **Verify（验收与守护）**：
+
+  * 30 天后复测：`% DSAT(1,2)`、`CPE CSAT` 改善幅度；
+  * 守护指标：`# Case Created` 不显著下滑、`# T3/IcM` 不恶化。
+
+**语义查询示例（可直接提问 LLM‑BI）**
+
+* 「按国家/产品/队列/根因看**近 30 天** `% DSAT(1,2)`，列出 Top 10 组合与 `# CSAT Response`」
+* 「对以上 Top 10 组合，显示 `IRHour@P75`、`% Open > 14 days`、`% FCR`」
+
+**数据质量注意**：跨事实钻取时注意 `QueueKey/QueueID` 一致化或桥接。
+
+---
+
+## ④ 首周解决率（%FWR）提升计划：Golden Week — **74%**
+
+**North‑Star KPI**：`% FWR`（首周解决率）
+**对照**：`% DSAT(1,2)`、`# T3/IcM`、`Avg DTS/DTC`、`IRHour@P75`
+**涉及事实**：`incident_created`（主），联动 survey/escalation/open
+
+### 闭环
+
+* **Sense**：以 `MonthName` × `Product` × `Queue` 看 `% FWR` 的尾部。
+* **Diagnose（DFS）**：
+
+  1. `Product Name` → 低 `%FWR` Top3；
+  2. → `Queue Name` → 识别**队列差异**；
+  3. → `RootPath` → 找到**过慢的根因**；
+  4. 联动：`IRHour@P75`、`% Open > 14 days`、`# T3`（时效/复杂度驱动？）。
+* **Decide**：对特定根因开 **D+1 复核**、**T+3 绿色通道**、**T+5 升级前置**。
+* **Act**：建立**“首周专班”**：固定每日站会，清单化推进。
+* **Verify**：两周后 `%FWR` 提升，同时 `DSAT%` 降、`T3/IcM` 降或持平。
+
+**语义查询示例**
+
+* 「按产品/队列/根因看 `% FWR` 的底部组合，附 `IRHour@P75` 与 `%>14d`」
+
+---
+
+## ⑤ 自助分流 ROI：Shift‑Left without Regret — **71%**
+
+**North‑Star KPI**：`% Self‑Help Deflection`（需统一口径），**守护**：`% DSAT(1,2)`、`# CreatedTickets/# TotalFlows`
+**涉及事实**：`selfhelpdeflection`（主），联动 survey/incident
+
+### 闭环
+
+* **Sense**：按 `Product` 看 `# TotalFlows`、`# CreatedTickets`、`% Deflection`。
+* **Diagnose（DFS）**：
+
+  1. `Product Name` → 高流量产品；
+  2. → `MonthName` → 看最近变化；
+  3. 叠加 `DSAT%/FCR`：识别**“高分流但体验不升”**的反常区。
+* **Decide**：
+
+  * 高置信意图→**强引导自助**；低置信→**快速转人工**；
+  * 内容 AB：问题前 10 意图做**知识卡/流程编排**。
+* **Act**：上线**对话编排**与**召回/精确率监控**；
+* **Verify**：`# CreatedTickets` 降而 `DSAT%` 不升，`FCR` 持平或升。
+
+**语义查询示例**
+
+* 「按产品看 `# TotalFlows/ # CreatedTickets / % Self‑Help Deflection`，并与 `% DSAT(1,2)` 关联」
+
+---
+
+## ⑥ 队列专业化与动态路由：Put Work Where It Wins — **63%**
+
+**North‑Star KPI**：组合目标（`Avg DTS` 下降、`% FCR` 上升、`% DSAT` 下降）
+**涉及事实**：`incident_closed`（时效），`customersurvey`（体验），`incident_created`（首响/基数）
+
+### 闭环
+
+* **Sense**：构建**队列×产品**绩效面板：`Avg DTS`、`% FCR`、`% DSAT`。
+* **Diagnose（DFS）**：
+
+  1. `Product Name` → 找到**某产品的赢家队列**（`Avg DTS` 低、`%FCR` 高）；
+  2. → `Queue Name` → 看该队列在其他产品是否也优；
+  3. → `Language/Site` → 判断是否**语言/地域优势**导致。
+* **Decide**：制定**专长映射**（Product→Queue），调整**路由权重**。
+* **Act**：灰度 20% 流量给“赢家队列”。
+* **Verify**：灰度期 `Avg DTS` 下降、`% FCR` 上升、`% DSAT` 不升；升级不恶化。
+
+**语义查询示例**
+
+* 「显示各队列在各产品的 `Avg DTS` 与 `% FCR`，按“低 DTS & 高 FCR”排序列出 Top 10 组合」
+
+---
+
+# 统一的「深度优先」打法（可复用骨架）
+
+**DFS 钻取顺序（推荐）**
+`MonthName → Country → Product Name → Queue Name → RootPath → Delivery Language → SiteName`
+**停止条件**：
+
+* 当前路径解释**≥80%** 目标差额（如 DSAT 超标 / 净入库）；或
+* 样本量不足（如 `# CSAT Response` < 30；或日级窗口 < 14 天）；或
+* 继续下钻指标改善**边际<5%**。
+  **回溯策略**：若在某层未发现显著差异（p75/均值差<5%），回溯上一层并换维度（如从国家改看语言/伙伴）。
+---
+
+# 每个主题的交付件（你可按“极简美学”实现）
+
+1. **一屏总览**：North‑Star + 守护指标（卡片）
+2. **三张钻取图**：按 DFS 次序的 Top/Worst 榜（条形/热力/散点）
+3. **行动清单**：自动生成（勾选式）
+4. **验证页**：Before/After 对比 + 守护指标
+5. **口径卡**：度量→语义模型字段映射（出自 `Atlas Measure Mapping`）
+
+---
+
+
