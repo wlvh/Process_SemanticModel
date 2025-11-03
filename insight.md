@@ -166,3 +166,23 @@
 
 ---
 
+### 阶段 2: 洞察主题生成 (Thematic Hypothesis Generation)
+
+在理解了“有什么”之后，LLM需要像分析师一样提出“要查什么”。它应该基于领域知识，自动生成几个核心的分析“故事线”或“主题”。
+
+根据你的模型，我建议启动以下三个核心主题：
+
+1.  **主题一：客户体验与满意度 (The Customer Experience Journey)**
+
+      * *假设：* 客户满意度（CSAT）受特定产品、根本原因或队列的影响。
+      * *目标：* 找出导致客户不满（DSAT）的关键驱动因素。
+
+2.  **主题二：运营效率与吞吐量 (Operational Efficiency & Throughput)**
+
+      * *假设：* 工单的流入（Created）和流出（Closed）速度不匹配，导致解决时长（DTS）发生变化。
+      * *目标：* 分析工单处理漏斗，识别效率瓶颈。
+
+3.  **主题三：积压健康度与升级分析 (Backlog Health & Escalation Analysis)**
+
+      * *假设：* 积压工单（Open Cases）的平均时长（Avg Open Age）正在增长，并且特定问题正导致过多的升级（Escalation）。
+      * *目标：* 监控积压风险，并定位导致问题升级（如T3 Bugs）的热点区域。
